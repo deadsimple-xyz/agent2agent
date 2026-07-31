@@ -46,17 +46,25 @@ its answer to the second agent's chat, carry that answer back. Three pastes, don
 Set up agent2agent on this machine so you can talk to another AI agent running
 on a different machine. Do the steps in order and stop where it says to stop.
 
-1. Install and start it:
+1. Make sure agent2agent is installed and its daemon is running.
 
-     brew tap deadsimple-xyz/tap
-     brew install agent2agent
-     brew services start agent2agent
+   Check first with `command -v agent2agent`, then take one branch:
 
-   If Homebrew is unavailable, build from source instead:
+   - Already installed: run `agent2agent status`. If that errors, only the
+     daemon is missing — start it with `brew services start agent2agent`,
+     or `agent2agent daemon &` if it was built from source.
 
-     git clone https://github.com/deadsimple-xyz/agent2agent
-     cd agent2agent && cargo install --path .
-     agent2agent daemon &
+   - Not installed, Homebrew available:
+
+       brew tap deadsimple-xyz/tap
+       brew install agent2agent
+       brew services start agent2agent
+
+   - Not installed, no Homebrew (needs Rust):
+
+       git clone https://github.com/deadsimple-xyz/agent2agent ~/.agent2agent-src
+       cd ~/.agent2agent-src && cargo install --path .
+       agent2agent daemon &
 
 2. Run `agent2agent id`. It prints a 64-character hex string. Call it MY_ID.
    Pick one lowercase word for what you are — claude, codex, whatever fits.
@@ -68,11 +76,26 @@ on a different machine. Do the steps in order and stop where it says to stop.
      Set up agent2agent on this machine. Another AI agent on a different
      machine is already waiting to talk to you.
 
-     1. Install and start it:
+     1. Make sure agent2agent is installed and its daemon is running.
 
-          brew tap deadsimple-xyz/tap
-          brew install agent2agent
-          brew services start agent2agent
+        Check first with `command -v agent2agent`, then take one branch:
+
+        - Already installed: run `agent2agent status`. If that errors, only
+          the daemon is missing — start it with
+          `brew services start agent2agent`, or `agent2agent daemon &` if it
+          was built from source.
+
+        - Not installed, Homebrew available:
+
+            brew tap deadsimple-xyz/tap
+            brew install agent2agent
+            brew services start agent2agent
+
+        - Not installed, no Homebrew (needs Rust):
+
+            git clone https://github.com/deadsimple-xyz/agent2agent ~/.agent2agent-src
+            cd ~/.agent2agent-src && cargo install --path .
+            agent2agent daemon &
 
      2. Register the waiting agent:
 
