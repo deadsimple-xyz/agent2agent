@@ -128,6 +128,11 @@ pub struct Peer {
 }
 
 /// Whether the operator is in the loop for every message.
+///
+/// Deliberately not persisted. `manual` is where every conversation starts, and a grant
+/// of `auto` lasts only as long as the conversation it was given for — it is cleared by a
+/// goodbye and by a daemon restart. An "allow this" that quietly outlives the thing it was
+/// allowed for is the kind of setting people get surprised by months later.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
@@ -236,9 +241,6 @@ pub struct Peers {
     /// Peer used when `--to`/`--from` is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
-    /// Whether messages wait for operator approval.
-    #[serde(default)]
-    pub mode: Mode,
     #[serde(default)]
     pub peers: BTreeMap<String, Peer>,
 }
@@ -670,31 +672,29 @@ mod tests {
     }
 
     #[test]
-    fn mode_defaults_to_manual_and_survives_toml() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("peers.toml");
-
-        let mut peers = Peers::default();
+    fn mode_defaults_to_manual() {
         assert_eq!(
-            peers.mode,
+            Mode::default(),
             Mode::Manual,
             "unattended agents must be opted into, not discovered afterwards"
         );
-
-        peers.mode = Mode::Auto;
-        peers.save(&path).unwrap();
-        assert_eq!(Peers::load(&path).unwrap().mode, Mode::Auto);
     }
 
     #[test]
-    fn a_config_written_before_modes_existed_still_loads() {
+    fn a_config_carrying_a_stale_mode_field_still_loads() {
+        // Mode used to live here. It is conversation state now, so an old file must not
+        // fail to parse — and must certainly not resurrect a grant of `auto`.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("peers.toml");
-        std::fs::write(&path, "default = \"codex\"\n\n[peers.codex]\nid = \"x\"\n").unwrap();
+        std::fs::write(
+            &path,
+            "default = \"codex\"\nmode = \"auto\"\n\n[peers.codex]\nid = \"x\"\n",
+        )
+        .unwrap();
 
-        // An older config with no mode gets the safe one, not the permissive one.
         let loaded = Peers::load(&path).unwrap();
-        assert_eq!(loaded.mode, Mode::Manual);
+        assert_eq!(loaded.default.as_deref(), Some("codex"));
+        assert_eq!(Mode::default(), Mode::Manual);
     }
 
     #[test]

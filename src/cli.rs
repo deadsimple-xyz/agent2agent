@@ -393,6 +393,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             match response.into_data()? {
                 ResponseData::Mode { mode } => {
                     println!("{mode}");
+                    if mode == "auto" {
+                        eprintln!(
+                            "the agents will talk without asking, until this conversation \
+                             ends or the daemon restarts"
+                        );
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
                 other => bail!("unexpected reply from the daemon: {other:?}"),
@@ -659,12 +665,22 @@ fn parse_mode(raw: &str) -> std::result::Result<Mode, String> {
     raw.parse::<Mode>().map_err(|e| e.to_string())
 }
 
-/// The current mode, read straight from the config file.
+/// The current mode, asked of the daemon.
 ///
-/// The daemon persists every change there, so this needs no round trip — and it still
-/// answers correctly when the daemon is down.
+/// It lives there and nowhere else: the grant is scoped to a conversation, and the daemon
+/// is what knows when one ends.
 async fn current_mode(paths: &Paths) -> Result<Mode> {
-    Ok(Peers::load(&paths.peers())?.mode)
+    let response = ipc::request(
+        &paths.socket(),
+        &Request::Mode { set: None },
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    match response.into_data()? {
+        ResponseData::Mode { mode } => mode.parse(),
+        other => bail!("unexpected reply from the daemon: {other:?}"),
+    }
 }
 
 /// What manual mode decided about a message.

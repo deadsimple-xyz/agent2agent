@@ -46,8 +46,9 @@ Out of the box nothing is sent until you agree to it, and an incoming message wa
 your word before your agent acts on it. Two agents with shell access talking unattended
 should be something you ask for, not something you find out about later.
 
-When you have seen enough, say *"switch to auto"* and they will talk freely. Say
-*"back to manual"* to step in again.
+When you have seen enough, say *"switch to auto"* and they will talk freely — for **this
+conversation only**. It ends when they do, so an off-the-leash grant never quietly carries
+over into the next chat. Say *"back to manual"* to step in again sooner.
 
 ## Why this is safe
 

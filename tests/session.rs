@@ -242,15 +242,14 @@ async fn manual_mode_is_enforced_by_the_daemon_not_the_cli() {
 
 #[tokio::test]
 async fn auto_mode_sends_without_asking() {
-    use agent2agent::config::{Mode, Peers};
     use agent2agent::ipc::{Request, ResponseData};
 
     let (claude, codex) = linked_pair("claude", "codex").await;
-
-    let mut peers = Peers::load(&claude.paths.peers()).unwrap();
-    peers.mode = Mode::Auto;
-    peers.save(&claude.paths.peers()).unwrap();
-    claude.daemon.reload_peers().await.unwrap();
+    claude
+        .daemon
+        .set_or_report_mode(Some("auto"))
+        .await
+        .unwrap();
 
     let data = claude
         .daemon
@@ -337,4 +336,81 @@ async fn a_fresh_session_considers_everyone_present() {
     let (claude, _codex) = linked_pair("claude", "codex").await;
     assert!(!claude.daemon.has_departed("codex").await);
     assert!(claude.daemon.send(None, "opening line").await.is_ok());
+}
+
+#[tokio::test]
+async fn a_grant_of_auto_lasts_only_for_this_conversation() {
+    use agent2agent::config::Mode;
+
+    // Stepping out of the loop is scoped to the conversation it was granted for: a
+    // goodbye puts the operator back in it, rather than leaving a permission behind.
+    let (claude, codex) = linked_pair("claude", "codex").await;
+    claude
+        .daemon
+        .set_or_report_mode(Some("auto"))
+        .await
+        .unwrap();
+    assert_eq!(claude.daemon.mode().await, Mode::Auto);
+
+    claude.daemon.send_kind(None, Kind::Bye, "").await.unwrap();
+
+    assert_eq!(
+        claude.daemon.mode().await,
+        Mode::Manual,
+        "saying goodbye ends the grant"
+    );
+    let _ = codex;
+}
+
+#[tokio::test]
+async fn a_peer_leaving_also_ends_the_grant() {
+    use agent2agent::config::Mode;
+
+    let (claude, codex) = linked_pair("claude", "codex").await;
+    claude
+        .daemon
+        .set_or_report_mode(Some("auto"))
+        .await
+        .unwrap();
+
+    codex.daemon.send_kind(None, Kind::Bye, "").await.unwrap();
+    claude
+        .daemon
+        .inbox()
+        .pop_wait(None, PATIENCE)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        claude.daemon.mode().await,
+        Mode::Manual,
+        "the other agent leaving ends the conversation too"
+    );
+}
+
+#[tokio::test]
+async fn a_new_daemon_starts_in_manual_whatever_happened_before() {
+    use agent2agent::config::{Mode, Peers};
+
+    // The grant is memory-only, so nothing on disk can bring it back.
+    let (claude, _codex) = linked_pair("claude", "codex").await;
+    claude
+        .daemon
+        .set_or_report_mode(Some("auto"))
+        .await
+        .unwrap();
+
+    let reloaded = Peers::load(&claude.paths.peers()).unwrap();
+    let text = std::fs::read_to_string(claude.paths.peers()).unwrap();
+    assert!(
+        !text.contains("auto"),
+        "the grant must not be written down: {text}"
+    );
+    assert!(!reloaded.peers.is_empty(), "the peer list itself survives");
+
+    let fresh = common::start_node(
+        common::offline_endpoint(iroh::SecretKey::generate()).await,
+        reloaded,
+    );
+    assert_eq!(fresh.daemon.mode().await, Mode::Manual);
 }

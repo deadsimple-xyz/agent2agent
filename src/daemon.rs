@@ -32,6 +32,13 @@ const CLOSE_UNAUTHORIZED: u32 = 1;
 /// joiner to hang up.
 const HANDSHAKE_LINGER: Duration = Duration::from_secs(10);
 
+/// How long to wait at startup for the endpoint to become reachable.
+///
+/// Binding a socket is instant; being findable is not. Until discovery has published this
+/// node, a peer handed its id cannot resolve an address for it — and the whole flow is
+/// "invite, paste, join", which happens in seconds.
+const ONLINE_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// An invite waiting to be redeemed. At most one is outstanding at a time: a second
 /// `invite` replaces the first, so a code left lying around stops working.
 #[derive(Debug, Clone)]
@@ -73,6 +80,11 @@ pub struct Daemon {
     options: Options,
     /// The outstanding invite, if `invite` has been run and not yet redeemed.
     invite: Mutex<Option<PendingInvite>>,
+    /// Whether the operator has stepped out of the loop for the current conversation.
+    ///
+    /// Not persisted and not permanent: a goodbye clears it, and so does a restart. The
+    /// grant is scoped to the conversation it was given for.
+    mode: RwLock<Mode>,
     /// Peers that have said goodbye, or that we have said goodbye to.
     ///
     /// Held in memory rather than on disk: a daemon restart is not a departure, and after
@@ -106,6 +118,7 @@ impl Daemon {
             peers: RwLock::new(peers),
             options,
             invite: Mutex::new(None),
+            mode: RwLock::new(Mode::default()),
             departed: RwLock::new(HashSet::new()),
             connections: Mutex::new(HashMap::new()),
         })
@@ -222,6 +235,7 @@ impl Daemon {
             Kind::Bye => {
                 self.departed.write().await.insert(peer_name.to_string());
                 info!(peer = %peer_name, "peer said goodbye");
+                self.end_of_conversation().await;
             }
             Kind::Msg | Kind::Hello => {
                 self.departed.write().await.remove(peer_name);
@@ -421,11 +435,22 @@ impl Daemon {
         token: &str,
         my_name: &str,
     ) -> Result<String> {
-        let connect = self.endpoint.connect(inviter, PAIR_ALPN);
-        let connection = tokio::time::timeout(self.options.send_timeout, connect)
-            .await
-            .map_err(|_| anyhow!("timed out reaching the inviting agent"))?
-            .context("cannot reach the inviting agent")?;
+        // Retry rather than failing on the first attempt: an invite is usually redeemed
+        // seconds after it was minted, and discovery may not have caught up with the
+        // inviter yet. "No addressing information" then means "not yet", not "never".
+        let deadline = tokio::time::Instant::now() + self.options.send_timeout;
+        let connection = loop {
+            match self.endpoint.connect(inviter.clone(), PAIR_ALPN).await {
+                Ok(connection) => break connection,
+                Err(e) if tokio::time::Instant::now() < deadline => {
+                    debug!(error = %e, "cannot reach the inviting agent yet, retrying");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => {
+                    return Err(e).context("cannot reach the inviting agent");
+                }
+            }
+        };
 
         let (mut send, mut recv) = connection.open_bi().await?;
         write_json(
@@ -488,6 +513,7 @@ impl Daemon {
             }
             Kind::Bye => {
                 self.departed.write().await.insert(name.clone());
+                self.end_of_conversation().await;
             }
             Kind::Msg => {}
         }
@@ -597,7 +623,7 @@ impl Daemon {
                     if self.departed.read().await.contains(&name) {
                         return Response::ok(ResponseData::PeerGone { peer: name });
                     }
-                    if !confirmed && self.peers.read().await.mode.is_manual() {
+                    if !confirmed && self.mode().await.is_manual() {
                         return Response::ok(ResponseData::NeedsApproval { peer: name });
                     }
                 }
@@ -656,6 +682,7 @@ impl Daemon {
 
             Request::Status => {
                 let invite_open = self.invite_is_open().await;
+                let mode = self.mode().await;
                 let mut departed: Vec<String> =
                     self.departed.read().await.iter().cloned().collect();
                 departed.sort();
@@ -668,7 +695,7 @@ impl Daemon {
                         .map(|(name, peer)| (name.clone(), peer.id.clone()))
                         .collect(),
                     default_peer: peers.default.clone(),
-                    mode: peers.mode.to_string(),
+                    mode: mode.to_string(),
                     invite_open,
                     departed,
                     queued: self.inbox.counts(),
@@ -691,19 +718,30 @@ impl Daemon {
         self.departed.read().await.contains(peer)
     }
 
-    /// Report the mode, or change it and persist the change.
+    /// Report the mode, or change it for the rest of this conversation.
     pub async fn set_or_report_mode(&self, set: Option<&str>) -> Result<Mode> {
-        let mut peers = self.peers.write().await;
+        let mut mode = self.mode.write().await;
         if let Some(raw) = set {
-            peers.mode = raw.parse::<Mode>()?;
-            peers.save(&self.paths.peers())?;
+            *mode = raw.parse::<Mode>()?;
         }
-        Ok(peers.mode)
+        Ok(*mode)
     }
 
     /// The current mode.
     pub async fn mode(&self) -> Mode {
-        self.peers.read().await.mode
+        *self.mode.read().await
+    }
+
+    /// Put the operator back in the loop.
+    ///
+    /// Called whenever a conversation ends, so a grant of `auto` cannot silently carry
+    /// over into the next one.
+    async fn end_of_conversation(&self) {
+        let mut mode = self.mode.write().await;
+        if *mode != Mode::Manual {
+            info!("conversation ended, back to approving each message");
+            *mode = Mode::Manual;
+        }
     }
 
     /// Re-read `peers.toml`. Returns how many peers are now configured.
@@ -830,6 +868,18 @@ pub async fn run(paths: Paths) -> Result<()> {
 
     let daemon = Daemon::new(paths.clone(), endpoint, peers);
     daemon.spawn_accept_loop();
+
+    // Do not answer commands until peers could actually reach us: `invite` handing out a
+    // code for an unpublished node produces one that cannot be redeemed yet.
+    if tokio::time::timeout(ONLINE_TIMEOUT, daemon.endpoint.online())
+        .await
+        .is_err()
+    {
+        warn!(
+            "endpoint is not reachable after {ONLINE_TIMEOUT:?}; carrying on, but peers may \
+             not be able to find this node"
+        );
+    }
 
     info!(
         id = %daemon.id(),

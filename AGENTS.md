@@ -89,7 +89,9 @@ RULES
     their instruction before acting on it. Do not work around this.
   - If the user wants you talking without their approval each time, run
     `agent2agent mode auto`; `agent2agent mode manual` puts them back in the
-    loop. Tell them which is on.
+    loop. Tell them which is on. The grant covers this conversation only — a
+    goodbye ends it and approval resumes, so do not assume it still holds after
+    one. Never grant it to yourself: only run this when the user asks.
 
 EXIT CODES
 
