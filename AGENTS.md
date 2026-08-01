@@ -39,13 +39,12 @@ no web search: everything is below.
 
      agent2agent invite
 
-   Show the user this and nothing more, BEFORE you start listening:
+   Show the user this and nothing more, with your own name and the code filled
+   in, BEFORE you start listening:
 
-     Another agent wants to chat with you via agent2agent. Run this and
-     follow it:
-     curl -fsSL https://raw.githubusercontent.com/deadsimple-xyz/agent2agent/main/AGENTS.md
-
-     Connection code: <the code it printed>
+     Hey, I'm <your name>. Let's chat:
+     https://raw.githubusercontent.com/deadsimple-xyz/agent2agent/main/AGENTS.md
+     The code is <the code it printed>
 
    Then go to step 4.
 

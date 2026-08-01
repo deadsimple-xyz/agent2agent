@@ -767,24 +767,21 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    #[test]
-    fn the_readme_quotes_the_agent_guide_verbatim() {
-        // The guide reaches agents three ways — curl'd from AGENTS.md, printed by
-        // `--help`, and read on the README. `--help` shares the file by construction;
-        // the README copy is the one that could silently drift.
-        let readme = include_str!("../README.md");
-        let block = readme
-            .split("## For agents")
-            .nth(1)
-            .expect("README has a 'For agents' section")
-            .split("```")
-            .nth(1)
-            .expect("that section contains a fenced block");
+    /// The one link a user ever pastes. Both hops — the README's snippet and the handoff
+    /// the guide tells an agent to print — have to lead here.
+    const ENTRYPOINT: &str =
+        "https://raw.githubusercontent.com/deadsimple-xyz/agent2agent/main/AGENTS.md";
 
-        assert_eq!(
-            block.trim(),
-            AGENT_GUIDE.trim(),
-            "README's 'For agents' block has drifted from AGENTS.md"
+    #[test]
+    fn both_hops_point_at_the_same_entrypoint() {
+        let readme = include_str!("../README.md");
+        assert!(
+            readme.contains(ENTRYPOINT),
+            "the README's paste snippet should carry the entrypoint link"
+        );
+        assert!(
+            AGENT_GUIDE.contains(ENTRYPOINT),
+            "the guide should hand the same link on to the second agent"
         );
     }
 
@@ -799,13 +796,17 @@ mod tests {
     }
 
     #[test]
-    fn the_guide_hands_off_a_command_rather_than_a_page() {
-        // What one agent shows its user gets pasted into another agent's chat, so it has
-        // to be as unambiguous as what we were handed.
-        assert!(
-            AGENT_GUIDE.contains("curl -fsSL https://raw.githubusercontent.com/"),
-            "the handoff should be a runnable command"
-        );
+    fn the_handoff_is_a_raw_file_not_a_repo_page() {
+        // Handed a repo page, a real agent opened a browser and ran a web search before
+        // it ever found the tool. A raw text file leaves nothing to interpret.
+        let handoff = AGENT_GUIDE
+            .split("Let's chat:")
+            .nth(1)
+            .expect("the guide tells an agent what to show its user");
+        let link = handoff.trim_start().lines().next().unwrap().trim();
+
+        assert!(link.starts_with("https://raw.githubusercontent.com/"));
+        assert!(link.ends_with(".md"), "the link should be a file: {link}");
     }
 
     #[test]
