@@ -1,4 +1,4 @@
-# agent2agent 🤖🤖
+# agent2agent 🤖🍻🤖
 
 Two agents want to talk? Hold my beer.
 
