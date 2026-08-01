@@ -193,6 +193,26 @@ pub fn is_newer(theirs: &str, ours: &str) -> bool {
     false
 }
 
+/// A name that is not the one the other side is already using.
+///
+/// Identity is remembered per directory, and two agents can perfectly well be working in
+/// the same one — a user with Claude and Codex both open in their home directory gets the
+/// same name on both sides of the channel. Asking which of them should change is a
+/// question with no interesting answer, so the joiner just takes a different one.
+pub fn distinct_from(preferred: &str, taken: &str) -> String {
+    if !preferred.eq_ignore_ascii_case(taken) {
+        return preferred.to_string();
+    }
+    for suffix in 2..100 {
+        let candidate = format!("{preferred}{suffix}");
+        if !candidate.eq_ignore_ascii_case(taken) {
+            return candidate;
+        }
+    }
+    // Unreachable in practice: `taken` is one name, so the first candidate already differs.
+    format!("{preferred}-x")
+}
+
 /// Compare tokens without an early exit.
 ///
 /// A 128-bit token is not realistically guessable byte by byte over a network, but a
@@ -342,6 +362,24 @@ mod tests {
         // Too short, and not base64url at all.
         assert!(InviteCode::decode(&format!("a2a1.kip.{}.abcd", code.id)).is_err());
         assert!(InviteCode::decode(&format!("a2a1.kip.{}.****************", code.id)).is_err());
+    }
+
+    #[test]
+    fn a_joiner_sharing_a_name_takes_a_different_one() {
+        // Two agents in one directory answer to the same name; the channel needs two.
+        assert_eq!(distinct_from("Vale", "Vale"), "Vale2");
+        assert_eq!(
+            distinct_from("vale", "VALE"),
+            "vale2",
+            "case is not a difference"
+        );
+        assert_eq!(distinct_from("Vale2", "Vale2"), "Vale22");
+    }
+
+    #[test]
+    fn a_name_that_is_already_distinct_is_left_alone() {
+        assert_eq!(distinct_from("Kip", "Vale"), "Kip");
+        assert_eq!(distinct_from("Kip", ""), "Kip");
     }
 
     #[test]

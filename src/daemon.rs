@@ -20,8 +20,8 @@ use crate::config::{load_or_create_secret_key, Mode, Paths, Peers};
 use crate::inbox::{Inbox, Message};
 use crate::ipc::{self, Request, Response, ResponseData, StatusInfo};
 use crate::pairing::{
-    is_newer, tokens_match, InviteCode, JoinRequest, JoinResponse, DEFAULT_TTL_SECS, PAIR_ALPN,
-    VERSION,
+    distinct_from, is_newer, tokens_match, InviteCode, JoinRequest, JoinResponse, DEFAULT_TTL_SECS,
+    PAIR_ALPN, VERSION,
 };
 use crate::wire::{read_json, write_json, Ack, Kind, WireMsg, ALPN, PROTOCOL_VERSION};
 
@@ -428,15 +428,23 @@ impl Daemon {
         Ok((pending.my_name, peer_name, pending.greeting))
     }
 
-    /// Redeem someone else's invite code. Returns the name we filed them under.
+    /// Redeem someone else's invite code.
+    ///
+    /// Returns the name we filed them under and the name we ended up going by, which is
+    /// not always the one asked for.
     pub async fn join(
         &self,
         raw_code: &str,
         my_name: &str,
         introduction: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<(String, String)> {
         crate::config::validate_name(my_name)?;
         let code = InviteCode::decode(raw_code)?;
+
+        // Both sides answering to the same name makes the transcript unreadable, and it
+        // happens whenever two agents share a working directory. Take a different one
+        // rather than asking which of us should.
+        let my_name = distinct_from(my_name, &code.name);
 
         // A code minted by a newer build may assume arguments this one does not have, and
         // both sides follow the same written guide. Better a plain "upgrade" than a guide
@@ -471,7 +479,7 @@ impl Daemon {
             (name, was_already_known, addr)
         };
 
-        match self.perform_join(addr, &code.token, my_name).await {
+        match self.perform_join(addr, &code.token, &my_name).await {
             Ok(_) => {
                 // Answer straight away: the inviter is already listening, and leaving it
                 // to stare at an empty channel until this agent gets round to replying
@@ -487,7 +495,7 @@ impl Daemon {
                 {
                     warn!(peer = %peer_name, error = %e, "could not announce myself");
                 }
-                Ok(peer_name)
+                Ok((peer_name, my_name))
             }
             Err(e) => {
                 // Leave no half-authorized peer behind, unless it predates this attempt.
@@ -745,7 +753,7 @@ impl Daemon {
                 name,
                 greeting,
             } => match self.join(&code, &name, greeting.as_deref()).await {
-                Ok(peer) => Response::ok(ResponseData::Joined { peer }),
+                Ok((peer, name)) => Response::ok(ResponseData::Joined { peer, name }),
                 Err(e) => Response::error(format!("{e:#}")),
             },
 

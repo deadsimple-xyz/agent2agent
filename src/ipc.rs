@@ -124,8 +124,10 @@ pub enum ResponseData {
     NoMessage,
     /// An invite was opened.
     Invite { code: String },
-    /// An invite was redeemed; `peer` is the local name of the other agent.
-    Joined { peer: String },
+    /// An invite was redeemed. `peer` is what we call the other agent, `name` what we
+    /// ended up calling ourselves — not always the one asked for, since both sides
+    /// answering to the same name makes the transcript unreadable.
+    Joined { peer: String, name: String },
     /// The current mode, after any change.
     Mode { mode: String },
     /// Daemon state.

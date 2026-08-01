@@ -465,8 +465,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             .await?;
 
             match response.into_data()? {
-                ResponseData::Joined { peer } => {
-                    eprintln!("paired with {peer}");
+                ResponseData::Joined { peer, name } => {
+                    eprintln!("paired with {peer}, and you are {name} on this channel");
                     report_session(&paths);
                     Ok(ExitCode::SUCCESS)
                 }

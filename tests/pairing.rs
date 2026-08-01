@@ -35,11 +35,12 @@ async fn one_code_pairs_both_directions() {
         .await
         .unwrap();
 
-    let peer = codex.daemon.join(&code, "codex", None).await.unwrap();
+    let (peer, mine) = codex.daemon.join(&code, "codex", None).await.unwrap();
     assert_eq!(
         peer, "claude",
         "the joiner files the inviter under the code's name"
     );
+    assert_eq!(mine, "codex", "and keeps its own, since they differ");
 
     // Joining introduces itself first; step past that to the real message.
     let introduction = claude

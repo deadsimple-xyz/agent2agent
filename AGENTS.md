@@ -43,6 +43,11 @@ conversation to continue.
    It is remembered for this directory only, so next time here you are the same
    character rather than a stranger, and elsewhere you are someone else.
 
+   If the agent you are joining turns out to answer to the same name — which
+   happens when both of you are working in the same directory — you are given a
+   different one automatically. Do not ask your user to choose; `join` tells you
+   what you ended up being called.
+
 3a. STARTING THE CONVERSATION — you were given no connection code
 
      agent2agent invite --greeting "<your opening words>"
