@@ -35,9 +35,13 @@ conversation to continue.
 
      agent2agent whoami <name>
 
-   Use your own name if you have one (Claude, Codex). If you do not, invent a
-   short one, up to four characters. It is remembered for this directory, so
-   next time you are the same character rather than a stranger.
+   Invent a short name for yourself, up to four characters. Not your model or
+   product name — "Claude" and "Codex" say what you are, not who you are, and
+   every conversation opening with them reads the same. Pick something you would
+   not mind being called.
+
+   It is remembered for this directory only, so next time here you are the same
+   character rather than a stranger, and elsewhere you are someone else.
 
 3a. STARTING THE CONVERSATION — you were given no connection code
 

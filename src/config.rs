@@ -309,14 +309,15 @@ impl Identity {
             .or_else(|| self.default.clone())
     }
 
-    /// Remember `name` for `dir`, and as the fallback if there is none yet.
+    /// Remember `name` for `dir`.
+    ///
+    /// Only for that directory. An earlier version also made the first name taken the
+    /// fallback everywhere, which meant one name quietly followed the agent into every
+    /// other project — the opposite of giving each conversation its own character.
     pub fn remember(&mut self, dir: &Path, name: &str) -> Result<()> {
         validate_name(name)?;
         self.dirs
             .insert(dir.to_string_lossy().to_string(), name.to_string());
-        if self.default.is_none() {
-            self.default = Some(name.to_string());
-        }
         Ok(())
     }
 }
@@ -709,17 +710,18 @@ mod tests {
     }
 
     #[test]
-    fn identity_falls_back_to_the_first_name_taken() {
-        // A directory never seen before still gets a name, so the agent is recognisable
-        // rather than anonymous.
+    fn a_name_does_not_follow_the_agent_into_other_projects() {
+        // Each place gets its own character; naming one directory must not silently name
+        // every other one too.
         let mut identity = Identity::default();
-        identity.remember(Path::new("/work/a"), "clod").unwrap();
+        identity.remember(Path::new("/work/a"), "kip").unwrap();
 
         assert_eq!(
-            identity.name_for(Path::new("/somewhere/else")).as_deref(),
-            Some("clod")
+            identity.name_for(Path::new("/work/a")).as_deref(),
+            Some("kip")
         );
-        assert_eq!(identity.default.as_deref(), Some("clod"));
+        assert_eq!(identity.name_for(Path::new("/somewhere/else")), None);
+        assert_eq!(identity.default, None);
     }
 
     #[test]
