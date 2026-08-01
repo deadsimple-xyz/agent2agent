@@ -2,14 +2,14 @@
 //! Claude-specific or Codex-specific here — each side just runs shell commands.
 
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::{load_or_create_secret_key, Identity, Mode, Paths, Peers};
+use crate::config::{self, load_or_create_secret_key, Identity, Mode, Paths, Peers};
 use crate::daemon;
 use crate::ipc::{self, Request, ResponseData};
 use crate::pairing::InviteCode;
@@ -80,6 +80,13 @@ pub struct Cli {
     /// State directory (default: $AGENT2AGENT_HOME, else ~/.config/agent2agent).
     #[arg(long, global = true, value_name = "DIR")]
     pub home: Option<PathBuf>,
+
+    /// The conversation to act on. Defaults to $AGENT2AGENT_SESSION.
+    ///
+    /// `invite` and `join` mint one; every other command needs it, so a new chat cannot
+    /// wander into a conversation it did not start.
+    #[arg(long, global = true, value_name = "ID")]
+    pub session: Option<String>,
 
     #[command(subcommand)]
     pub command: Command,
@@ -192,6 +199,13 @@ pub enum Command {
         set: Option<Mode>,
     },
 
+    /// List conversations on this machine.
+    Sessions {
+        /// Also delete the ones nobody is serving.
+        #[arg(long)]
+        prune: bool,
+    },
+
     /// Show identity, peers and queue depth.
     Status {
         /// Print as JSON.
@@ -224,12 +238,73 @@ pub enum PeerAction {
 }
 
 impl Cli {
-    fn paths(&self) -> Result<Paths> {
+    /// The session to act on, if one was named.
+    fn paths(&self) -> Result<Option<Paths>> {
         match &self.home {
-            Some(dir) => Ok(Paths::from_dir(dir)),
-            None => Paths::resolve(),
+            Some(dir) => match &self.session {
+                Some(id) => Paths::for_session(dir, id).map(Some),
+                None => Ok(Some(Paths::from_dir(dir))),
+            },
+            None => Paths::resolve(self.session.as_deref()),
         }
     }
+
+    /// The base directory, whether or not a session was named.
+    fn base(&self) -> Result<PathBuf> {
+        match &self.home {
+            Some(dir) => Ok(dir.clone()),
+            None => Paths::base_dir(),
+        }
+    }
+
+    /// Mint a session under the right base directory.
+    fn new_session(&self) -> Result<Paths> {
+        match &self.home {
+            // An explicit --home with no --session is a self-contained directory: tests and
+            // one-off runs want exactly what they asked for, not a subdirectory of it.
+            Some(dir) if self.session.is_none() => Ok(Paths::from_dir(dir)),
+            _ => Paths::for_session(self.base()?, &config::new_session_id()),
+        }
+    }
+}
+
+/// Tell the caller which conversation this was, so it can keep addressing it.
+fn report_session(paths: &Paths) {
+    if let Some(id) = paths.session() {
+        eprintln!(
+            "session {id} — pass --session {id} (or export {}={id}) on every later command",
+            config::SESSION_ENV
+        );
+    }
+}
+
+/// Stop the daemon serving this conversation and delete its state.
+async fn end_session(paths: &Paths) -> Result<()> {
+    // Best effort: a daemon that is already gone is the outcome we wanted anyway.
+    let _ = ipc::request(&paths.socket(), &Request::Shutdown, Duration::from_secs(10)).await;
+
+    // Give it a moment to release the socket before the directory goes.
+    for _ in 0..20 {
+        if !ipc::is_daemon_running(&paths.socket()).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    if paths.session().is_some() {
+        paths.remove()?;
+        eprintln!("conversation ended");
+    }
+    Ok(())
+}
+
+/// Refusing to guess which conversation was meant is the whole point.
+fn no_session() -> anyhow::Error {
+    anyhow::anyhow!(
+        "no conversation selected. Start one with `agent2agent invite`, join one with \
+         `agent2agent join <code>`, or name an existing one with --session <id> \
+         (`agent2agent sessions` lists them)"
+    )
 }
 
 /// Commands that need a live daemon. Anything else works without one.
@@ -280,7 +355,23 @@ async fn ensure_daemon(paths: &Paths) -> Result<()> {
 
 /// Run a parsed command.
 pub async fn run(cli: Cli) -> Result<ExitCode> {
-    let paths = cli.paths()?;
+    let base = cli.base()?;
+
+    // Two commands are about this machine rather than any one conversation.
+    match &cli.command {
+        Command::Whoami { name } => return run_whoami(&base, name.clone()),
+        Command::Sessions { prune } => return run_sessions(&base, *prune).await,
+        _ => {}
+    }
+
+    let paths = match cli.paths()? {
+        Some(paths) => paths,
+        // Only these two open a conversation, so only these two may invent one.
+        None if matches!(cli.command, Command::Invite { .. } | Command::Join { .. }) => {
+            cli.new_session()?
+        }
+        None => return Err(no_session()),
+    };
 
     if needs_daemon(&cli.command) {
         ensure_daemon(&paths).await?;
@@ -306,28 +397,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
         Command::Peer { action } => run_peer(&paths, action).await,
 
-        Command::Whoami { name } => {
-            let dir = std::env::current_dir().context("reading the current directory")?;
-            let mut identity = Identity::load(&paths.identity())?;
-
-            match name {
-                Some(name) => {
-                    identity.remember(&dir, &name)?;
-                    identity.save(&paths.identity())?;
-                    println!("{name}");
-                }
-                None => match identity.name_for(&dir) {
-                    Some(name) => println!("{name}"),
-                    None => {
-                        eprintln!(
-                            "no name set here — pick a short one and run `agent2agent whoami <name>`"
-                        );
-                        return Ok(ExitCode::FAILURE);
-                    }
-                },
-            }
-            Ok(ExitCode::SUCCESS)
-        }
+        // Handled above, before a session was required.
+        Command::Whoami { .. } | Command::Sessions { .. } => unreachable!(),
 
         Command::Invite {
             name,
@@ -351,6 +422,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             match response.into_data()? {
                 ResponseData::Invite { code } => {
                     println!("{code}");
+                    report_session(&paths);
                     Ok(ExitCode::SUCCESS)
                 }
                 other => bail!("unexpected reply from the daemon: {other:?}"),
@@ -374,6 +446,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             match response.into_data()? {
                 ResponseData::Joined { peer } => {
                     eprintln!("paired with {peer}");
+                    report_session(&paths);
                     Ok(ExitCode::SUCCESS)
                 }
                 other => bail!("unexpected reply from the daemon: {other:?}"),
@@ -421,7 +494,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
         Command::Bye { to, message } => {
             let body = optional_message(message);
-            deliver(&paths, to, Kind::Bye, &body, true).await
+            let code = deliver(&paths, to, Kind::Bye, &body, true).await?;
+
+            // The conversation is over, so its state goes with it. Leaving it behind is
+            // how the next chat ends up continuing this one.
+            end_session(&paths).await?;
+            Ok(code)
         }
 
         Command::Recv { from, wait, json } => {
@@ -659,6 +737,65 @@ async fn deliver(
 /// so an absent message is a bare signal rather than a prompt to block on stdin.
 fn optional_message(parts: Vec<String>) -> String {
     parts.join(" ")
+}
+
+/// Show or set what this agent calls itself here. Not tied to any conversation.
+fn run_whoami(base: &Path, name: Option<String>) -> Result<ExitCode> {
+    let paths = Paths::from_dir(base);
+    let dir = std::env::current_dir().context("reading the current directory")?;
+    let mut identity = Identity::load(&paths.identity())?;
+
+    match name {
+        Some(name) => {
+            identity.remember(&dir, &name)?;
+            identity.save(&paths.identity())?;
+            println!("{name}");
+        }
+        None => match identity.name_for(&dir) {
+            Some(name) => println!("{name}"),
+            None => {
+                eprintln!(
+                    "no name set here — pick a short one and run `agent2agent whoami <name>`"
+                );
+                return Ok(ExitCode::FAILURE);
+            }
+        },
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// List conversations, and optionally clear away the ones nobody is serving.
+async fn run_sessions(base: &Path, prune: bool) -> Result<ExitCode> {
+    let dir = Paths::sessions_dir(base);
+    let mut ids: Vec<String> = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).context(format!("reading {}", dir.display())),
+    };
+    ids.sort();
+
+    if ids.is_empty() {
+        println!("no conversations");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    for id in ids {
+        let paths = Paths::for_session(base, &id)?;
+        let live = ipc::is_daemon_running(&paths.socket()).await;
+        if live {
+            println!("{id}  live");
+        } else if prune {
+            paths.remove()?;
+            println!("{id}  removed");
+        } else {
+            println!("{id}  stopped");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn parse_mode(raw: &str) -> std::result::Result<Mode, String> {
@@ -946,7 +1083,10 @@ mod tests {
     fn home_overrides_the_resolved_default() {
         let cli =
             Cli::try_parse_from(["agent2agent", "--home", "/tmp/explicit", "status"]).unwrap();
-        assert_eq!(cli.paths().unwrap().dir(), PathBuf::from("/tmp/explicit"));
+        assert_eq!(
+            cli.paths().unwrap().unwrap().dir(),
+            PathBuf::from("/tmp/explicit")
+        );
     }
 
     #[test]

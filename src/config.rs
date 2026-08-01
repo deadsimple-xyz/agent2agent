@@ -14,36 +14,94 @@ use crate::util::{from_hex, to_hex};
 /// running two independent identities on one machine.
 pub const HOME_ENV: &str = "AGENT2AGENT_HOME";
 
-/// Resolved locations of everything we persist.
+/// Environment variable naming the conversation to act on.
+pub const SESSION_ENV: &str = "AGENT2AGENT_SESSION";
+
+/// Where a single conversation keeps its state.
+///
+/// A conversation is a *session*, not a property of the machine. Its key, its peer and its
+/// mode live in a directory of their own, thrown away when the conversation ends. Without
+/// that, any agent running `send` walks into whatever chat happens to be on the machine and
+/// carries on as though it were theirs — which is exactly what happened the first time a
+/// second agent was pointed at this tool.
+///
+/// The one thing that outlives a session is the name you go by, which is why identity sits
+/// in the base directory rather than the session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
+    base: PathBuf,
     dir: PathBuf,
+    session: Option<String>,
 }
 
 impl Paths {
-    /// Use an explicit directory.
+    /// Treat `dir` as both the base and the session directory: flat and self-contained,
+    /// which is what tests want.
     pub fn from_dir(dir: impl Into<PathBuf>) -> Self {
-        Self { dir: dir.into() }
+        let dir = dir.into();
+        Self {
+            base: dir.clone(),
+            dir,
+            session: None,
+        }
     }
 
-    /// `$AGENT2AGENT_HOME`, else `$XDG_CONFIG_HOME/agent2agent`, else `~/.config/agent2agent`.
-    pub fn resolve() -> Result<Self> {
+    /// The base directory: `$AGENT2AGENT_HOME`, else `$XDG_CONFIG_HOME/agent2agent`, else
+    /// `~/.config/agent2agent`.
+    pub fn base_dir() -> Result<PathBuf> {
         if let Some(dir) = std::env::var_os(HOME_ENV).filter(|v| !v.is_empty()) {
-            return Ok(Self::from_dir(dir));
+            return Ok(PathBuf::from(dir));
         }
         if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-            return Ok(Self::from_dir(PathBuf::from(xdg).join("agent2agent")));
+            return Ok(PathBuf::from(xdg).join("agent2agent"));
         }
         let home = std::env::var_os("HOME").filter(|v| !v.is_empty()).context(
             "cannot determine the state directory: neither AGENT2AGENT_HOME nor HOME is set",
         )?;
-        Ok(Self::from_dir(
-            PathBuf::from(home).join(".config").join("agent2agent"),
-        ))
+        Ok(PathBuf::from(home).join(".config").join("agent2agent"))
+    }
+
+    /// Locate a named session under a base directory.
+    pub fn for_session(base: impl Into<PathBuf>, session: &str) -> Result<Self> {
+        validate_session_id(session)?;
+        let base = base.into();
+        let dir = Self::sessions_dir(&base).join(session);
+        Ok(Self {
+            base,
+            dir,
+            session: Some(session.to_string()),
+        })
+    }
+
+    /// The session to act on: the id given, else `$AGENT2AGENT_SESSION`, else none.
+    pub fn resolve(session: Option<&str>) -> Result<Option<Self>> {
+        let base = Self::base_dir()?;
+        let chosen = match session {
+            Some(id) => Some(id.to_string()),
+            None => std::env::var(SESSION_ENV).ok().filter(|v| !v.is_empty()),
+        };
+        match chosen {
+            Some(id) => Ok(Some(Self::for_session(base, &id)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Where all sessions live.
+    pub fn sessions_dir(base: &Path) -> PathBuf {
+        base.join("sessions")
+    }
+
+    pub fn base(&self) -> &Path {
+        &self.base
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The session id, if this is a session rather than a bare directory.
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
     }
 
     pub fn secret_key(&self) -> PathBuf {
@@ -58,8 +116,10 @@ impl Paths {
         self.dir.join("daemon.sock")
     }
 
+    /// Names are shared across sessions on purpose: the conversation is disposable, the
+    /// character you play in it is not.
     pub fn identity(&self) -> PathBuf {
-        self.dir.join("identity.toml")
+        self.base.join("identity.toml")
     }
 
     /// Create the state directory if needed, owner-accessible only.
@@ -69,6 +129,32 @@ impl Paths {
         set_mode(&self.dir, 0o700)?;
         Ok(())
     }
+
+    /// Delete this session's state. The conversation is over; nothing should be left for
+    /// anyone to wander into.
+    pub fn remove(&self) -> Result<()> {
+        if self.dir.exists() {
+            std::fs::remove_dir_all(&self.dir)
+                .with_context(|| format!("removing session directory {}", self.dir.display()))?;
+        }
+        Ok(())
+    }
+}
+
+/// A fresh session id: short enough to paste, random enough not to collide.
+pub fn new_session_id() -> String {
+    crate::util::random_hex(4)
+}
+
+/// Session ids end up in file paths, so keep them to hex.
+pub fn validate_session_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > 32 {
+        bail!("session id {id:?} should be 1 to 32 characters");
+    }
+    if !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        bail!("session id {id:?} should be hexadecimal");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -469,8 +555,13 @@ mod tests {
     fn paths_prefer_the_home_env_var() {
         let dir = TempDir::new().unwrap();
         temp_env(HOME_ENV, dir.path().to_str().unwrap(), || {
-            let paths = Paths::resolve().unwrap();
-            assert_eq!(paths.dir(), dir.path());
+            // With a session named, state lands under the base directory.
+            let paths = Paths::resolve(Some("abcd1234")).unwrap().unwrap();
+            assert_eq!(paths.base(), dir.path());
+            assert_eq!(paths.dir(), dir.path().join("sessions").join("abcd1234"));
+
+            // With none, nothing is guessed.
+            assert!(Paths::resolve(None).unwrap().is_none());
             assert_eq!(paths.secret_key().file_name().unwrap(), "secret.key");
             assert_eq!(paths.peers().file_name().unwrap(), "peers.toml");
             assert_eq!(paths.socket().file_name().unwrap(), "daemon.sock");
@@ -876,5 +967,102 @@ mod tests {
         if let Err(payload) = result {
             std::panic::resume_unwind(payload);
         }
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn a_session_keeps_its_state_apart_from_its_neighbours() {
+        let dir = TempDir::new().unwrap();
+        let a = Paths::for_session(dir.path(), "aaaa1111").unwrap();
+        let b = Paths::for_session(dir.path(), "bbbb2222").unwrap();
+
+        assert_ne!(a.dir(), b.dir());
+        assert_ne!(a.secret_key(), b.secret_key());
+        assert_ne!(a.peers(), b.peers());
+        assert_ne!(a.socket(), b.socket());
+    }
+
+    #[test]
+    fn the_name_you_go_by_is_shared_across_sessions() {
+        // The conversation is disposable; the character is not.
+        let dir = TempDir::new().unwrap();
+        let a = Paths::for_session(dir.path(), "aaaa1111").unwrap();
+        let b = Paths::for_session(dir.path(), "bbbb2222").unwrap();
+        assert_eq!(a.identity(), b.identity());
+        assert_eq!(a.identity(), dir.path().join("identity.toml"));
+    }
+
+    #[test]
+    fn ending_a_session_removes_everything_it_held() {
+        let dir = TempDir::new().unwrap();
+        let paths = Paths::for_session(dir.path(), "cafe0001").unwrap();
+        paths.ensure_dir().unwrap();
+        load_or_create_secret_key(&paths).unwrap();
+        assert!(paths.secret_key().exists());
+
+        paths.remove().unwrap();
+        assert!(!paths.dir().exists(), "nothing may be left to wander into");
+
+        // Removing a session that is already gone is not an error.
+        paths.remove().unwrap();
+    }
+
+    #[test]
+    fn each_session_gets_its_own_key() {
+        let dir = TempDir::new().unwrap();
+        let a = Paths::for_session(dir.path(), "aaaa1111").unwrap();
+        let b = Paths::for_session(dir.path(), "bbbb2222").unwrap();
+
+        let key_a = load_or_create_secret_key(&a).unwrap();
+        let key_b = load_or_create_secret_key(&b).unwrap();
+        assert_ne!(
+            key_a.public(),
+            key_b.public(),
+            "a new conversation must not be reachable by an old code"
+        );
+    }
+
+    #[test]
+    fn a_reused_session_id_finds_the_same_state() {
+        let dir = TempDir::new().unwrap();
+        let first = Paths::for_session(dir.path(), "d00d0001").unwrap();
+        let key = load_or_create_secret_key(&first).unwrap();
+
+        let again = Paths::for_session(dir.path(), "d00d0001").unwrap();
+        assert_eq!(
+            load_or_create_secret_key(&again).unwrap().public(),
+            key.public()
+        );
+    }
+
+    #[test]
+    fn session_ids_are_unique_and_path_safe() {
+        let a = new_session_id();
+        let b = new_session_id();
+        assert_ne!(a, b);
+        validate_session_id(&a).unwrap();
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_session_id_that_could_escape_the_directory_is_refused() {
+        assert!(validate_session_id("../../etc").is_err());
+        assert!(validate_session_id("a/b").is_err());
+        assert!(validate_session_id("").is_err());
+        assert!(validate_session_id("nothex").is_err());
+        assert!(Paths::for_session("/tmp", "../escape").is_err());
+    }
+
+    #[test]
+    fn sessions_live_under_the_base_directory() {
+        let paths = Paths::for_session("/tmp/base", "abcd1234").unwrap();
+        assert_eq!(paths.dir(), Path::new("/tmp/base/sessions/abcd1234"));
+        assert_eq!(paths.session(), Some("abcd1234"));
+        assert_eq!(paths.base(), Path::new("/tmp/base"));
     }
 }

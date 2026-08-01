@@ -73,6 +73,8 @@ pub enum Request {
     },
     /// Re-read `peers.toml` from disk.
     Reload,
+    /// Stop the daemon. Sent when a conversation ends and its state is discarded.
+    Shutdown,
 }
 
 /// The daemon's reply.

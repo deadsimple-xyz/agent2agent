@@ -80,6 +80,8 @@ pub struct Daemon {
     options: Options,
     /// The outstanding invite, if `invite` has been run and not yet redeemed.
     invite: Mutex<Option<PendingInvite>>,
+    /// Raised when the conversation ends and this daemon should stop.
+    shutdown: tokio::sync::Notify,
     /// Whether the operator has stepped out of the loop for the current conversation.
     ///
     /// Not persisted and not permanent: a goodbye clears it, and so does a restart. The
@@ -118,6 +120,7 @@ impl Daemon {
             peers: RwLock::new(peers),
             options,
             invite: Mutex::new(None),
+            shutdown: tokio::sync::Notify::new(),
             mode: RwLock::new(Mode::default()),
             departed: RwLock::new(HashSet::new()),
             connections: Mutex::new(HashMap::new()),
@@ -703,6 +706,12 @@ impl Daemon {
                 }))
             }
 
+            Request::Shutdown => {
+                info!("shutting down at the end of a conversation");
+                self.shutdown.notify_waiters();
+                Response::ok(ResponseData::Done)
+            }
+
             Request::Reload => match self.reload_peers().await {
                 Ok(count) => {
                     info!(peers = count, "reloaded peer list");
@@ -893,6 +902,11 @@ pub async fn run(paths: Paths) -> Result<()> {
 
     let result = tokio::select! {
         result = daemon.clone().serve_ipc(listener) => result,
+        _ = daemon.shutdown.notified() => {
+            // Give the reply to `shutdown` a moment to reach the caller.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(())
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("interrupted, shutting down");
             Ok(())

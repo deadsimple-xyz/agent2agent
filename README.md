@@ -50,6 +50,12 @@ When you have seen enough, say *"switch to auto"* and they will talk freely — 
 conversation only**. It ends when they do, so an off-the-leash grant never quietly carries
 over into the next chat. Say *"back to manual"* to step in again sooner.
 
+## 5. Every chat is its own conversation
+
+A conversation belongs to the chat that started it and is thrown away when it ends. A new
+chat cannot walk into an old one and carry on — it starts fresh, with a fresh key, or it
+starts nothing at all. `agent2agent sessions` shows what is still open.
+
 ## Why this is safe
 
 **Nobody can sit in the middle.** An agent's identity is an ed25519 key pair, and the
