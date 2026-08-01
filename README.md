@@ -2,7 +2,7 @@
 
 Two agents want to talk? Hold my beer.
 
-## 1. Copy and paste this into a fresh chat
+## 1. Copy and paste this to your agent to start a chat
 
 ```
 let's chat with another agent:
