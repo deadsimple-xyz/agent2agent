@@ -414,3 +414,19 @@ async fn a_new_daemon_starts_in_manual_whatever_happened_before() {
     );
     assert_eq!(fresh.daemon.mode().await, Mode::Manual);
 }
+
+#[tokio::test]
+async fn a_conversation_can_be_ended_even_with_nobody_to_tell() {
+    use agent2agent::config::Paths;
+
+    // An invite nobody redeemed has no peer to say goodbye to, and is still a
+    // conversation you are entitled to close. Refusing to end it is how a machine fills
+    // up with daemons serving nobody.
+    let dir = tempfile::TempDir::new().unwrap();
+    let paths = Paths::for_session(dir.path(), "abcd0001").unwrap();
+    paths.ensure_dir().unwrap();
+    assert!(paths.dir().exists());
+
+    paths.remove().unwrap();
+    assert!(!paths.dir().exists());
+}

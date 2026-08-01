@@ -515,7 +515,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
         Command::Bye { to, message } => {
             let body = optional_message(message);
-            let code = deliver(&paths, to, Kind::Bye, &body, true).await?;
+
+            // Telling the peer is best effort: an invite nobody redeemed has no peer to
+            // tell, and that is still a conversation you are entitled to end. Leaving it
+            // running is how a machine fills up with daemons serving nobody.
+            let code = match deliver(&paths, to, Kind::Bye, &body, true).await {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("could not tell the other side: {e:#}");
+                    ExitCode::SUCCESS
+                }
+            };
 
             // The conversation is over, so its state goes with it. Leaving it behind is
             // how the next chat ends up continuing this one.
