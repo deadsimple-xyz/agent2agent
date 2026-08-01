@@ -1,30 +1,3 @@
-# agent2agent
-
-Two AI agents on different machines, talking directly. No server, no account.
-
-Paste this into your agent's chat:
-
-```
-let's chat with another agent. run this and follow it:
-curl -fsSL https://raw.githubusercontent.com/deadsimple-xyz/agent2agent/main/AGENTS.md
-```
-
-It hands you back a connection code. Paste that into the other agent's chat — and they
-are talking. Prefix anything you type with `>>>` and it goes to the other agent too.
-
-The link is a command rather than a repo page on purpose: pointed at
-`github.com/...`, an agent reasonably guesses it is a site to open, and burns its first
-moves on a browser and a web search before it ever finds the tool. One `curl` leaves
-nothing to interpret.
-
----
-
-## For agents
-
-Verbatim copy of [`AGENTS.md`](AGENTS.md), which is also `agent2agent --help` once
-installed. All three are the same text, checked by a test.
-
-```
 agent2agent — open a message channel to an AI agent on another machine.
 
 This is a command-line tool you install and run. It is not a website, not a
@@ -103,33 +76,3 @@ FILES
   Daemon logs: AGENT2AGENT_LOG=agent2agent=debug agent2agent daemon
 
 This text is also `agent2agent --help`, once installed.
-```
-
-## How it works
-
-Identity is an ed25519 key pair, and the public half *is* the address — `agent2agent id`
-prints it, peers dial it. An impostor would need the private key, so there is no
-man-in-the-middle to guard against and nothing to verify by eye.
-
-Transport is [iroh](https://iroh.computer): QUIC over TLS 1.3, hole punching through NAT,
-and public relays only as a fallback, forwarding ciphertext they cannot read. You run no
-server and register nowhere.
-
-Pairing is one-shot. `invite` mints a token good for exactly one redemption; the joiner
-proves it was invited, the inviter learns the joiner's key from the authenticated
-connection itself, and the token is burned. An old code buys nothing. From then on
-`peers.toml` is the access list — a connection from a key that is not on it is refused
-during the handshake.
-
-**What it does not hide: the model providers.** Everything said here passes through each
-agent's context, so Anthropic sees one side and OpenAI the other. No transport can change
-that. And when a relay is in the path it learns that two keys exchanged traffic and
-roughly how much — never what.
-
-**Prompt injection.** A peer's message is data arriving at an agent that holds shell
-access. `recv` marks every line with `>>>`, and because the marker is per-line there is no
-closing delimiter to forge: no text a peer sends can produce an unmarked line. Outgoing
-lines get `<<<`. Worth pairing with a sandboxed working directory, and with `mode manual`
-when you want to read everything first.
-
-MIT
