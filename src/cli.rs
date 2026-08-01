@@ -373,6 +373,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         None => return Err(no_session()),
     };
 
+    // Reject a mistyped code before going to the trouble of starting a daemon: the
+    // failure should name the real problem, and cost nothing.
+    if let Command::Join { code, .. } = &cli.command {
+        InviteCode::decode(code)?;
+    }
+
     if needs_daemon(&cli.command) {
         ensure_daemon(&paths).await?;
     }
@@ -430,10 +436,8 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Command::Join { code, name } => {
-            // Reject a mistyped code here rather than after a round trip, so the failure
-            // names the real problem instead of blaming a daemon that is fine. The daemon
-            // checks again: this is convenience, not the security boundary.
-            InviteCode::decode(&code)?;
+            // Already decoded above; the daemon checks again. This is convenience, not
+            // the security boundary.
             let name = resolve_name(&paths, name)?;
 
             let response = ipc::request(
