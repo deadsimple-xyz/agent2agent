@@ -52,6 +52,22 @@ pub fn random_hex(bytes: usize) -> String {
     to_hex(&buf)
 }
 
+/// Render an error and its causes, dropping links that repeat what was already said.
+///
+/// `{:#}` on an anyhow error prints every link in the chain, and a stack of them saying
+/// the same word produces "cannot reach the peer: timed out: timed out: timed out", which
+/// reads like a bug in the reporting rather than a description of what happened.
+pub fn describe(error: &anyhow::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for cause in error.chain() {
+        let text = cause.to_string();
+        if parts.last().map(String::as_str) != Some(text.as_str()) {
+            parts.push(text);
+        }
+    }
+    parts.join(": ")
+}
+
 /// A fresh message id.
 pub fn new_message_id() -> String {
     random_hex(16)
@@ -99,6 +115,34 @@ mod tests {
         assert_eq!(b.len(), 32);
         assert_ne!(a, b, "two draws must not collide");
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn describe_collapses_a_chain_that_repeats_itself() {
+        let error = anyhow::anyhow!("timed out")
+            .context("timed out")
+            .context("timed out")
+            .context("cannot reach the inviting agent");
+        assert_eq!(
+            describe(&error),
+            "cannot reach the inviting agent: timed out"
+        );
+    }
+
+    #[test]
+    fn describe_keeps_causes_that_actually_differ() {
+        let error = anyhow::anyhow!("connection refused")
+            .context("dialling the peer")
+            .context("sending a message");
+        assert_eq!(
+            describe(&error),
+            "sending a message: dialling the peer: connection refused"
+        );
+    }
+
+    #[test]
+    fn describe_handles_a_single_link() {
+        assert_eq!(describe(&anyhow::anyhow!("alone")), "alone");
     }
 
     #[test]

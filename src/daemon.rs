@@ -527,7 +527,11 @@ impl Daemon {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 Err(e) => {
-                    return Err(e).context("cannot reach the inviting agent");
+                    return Err(e).context(
+                        "cannot reach the inviting agent: its daemon is not answering. The \
+                         invite may already have been redeemed, or the conversation it \
+                         belongs to may have ended — ask for a fresh code",
+                    );
                 }
             }
         };
@@ -694,7 +698,7 @@ impl Daemon {
                 // Resolve first, so both refusals below can name the peer.
                 let name = match self.peers.read().await.resolve(peer.as_deref()) {
                     Ok((name, _)) => name,
-                    Err(e) => return Response::error(format!("{e:#}")),
+                    Err(e) => return Response::error(crate::util::describe(&e)),
                 };
 
                 // Ordinary messages only: hello and bye are control signals, and a
@@ -710,7 +714,7 @@ impl Daemon {
 
                 match self.send_kind(Some(&name), kind, &body).await {
                     Ok((peer, id)) => Response::ok(ResponseData::Sent { peer, id }),
-                    Err(e) => Response::error(format!("{e:#}")),
+                    Err(e) => Response::error(crate::util::describe(&e)),
                 }
             }
 
@@ -744,7 +748,7 @@ impl Daemon {
                 });
                 match self.create_invite(&name, greeting, ttl).await {
                     Ok(code) => Response::ok(ResponseData::Invite { code }),
-                    Err(e) => Response::error(format!("{e:#}")),
+                    Err(e) => Response::error(crate::util::describe(&e)),
                 }
             }
 
@@ -754,14 +758,14 @@ impl Daemon {
                 greeting,
             } => match self.join(&code, &name, greeting.as_deref()).await {
                 Ok((peer, name)) => Response::ok(ResponseData::Joined { peer, name }),
-                Err(e) => Response::error(format!("{e:#}")),
+                Err(e) => Response::error(crate::util::describe(&e)),
             },
 
             Request::Mode { set } => match self.set_or_report_mode(set.as_deref()).await {
                 Ok(mode) => Response::ok(ResponseData::Mode {
                     mode: mode.to_string(),
                 }),
-                Err(e) => Response::error(format!("{e:#}")),
+                Err(e) => Response::error(crate::util::describe(&e)),
             },
 
             Request::Status => {
@@ -798,7 +802,7 @@ impl Daemon {
                     info!(peers = count, "reloaded peer list");
                     Response::ok(ResponseData::Done)
                 }
-                Err(e) => Response::error(format!("{e:#}")),
+                Err(e) => Response::error(crate::util::describe(&e)),
             },
         }
     }

@@ -374,15 +374,28 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         _ => {}
     }
 
-    let paths = match cli.paths()? {
-        Some(paths) => paths,
-        // Only these two open a conversation, so only these two may invent one.
-        None if matches!(cli.command, Command::Invite { .. } | Command::Join { .. }) => {
-            cli.new_session()?
-        }
+    // Whether this command opens a conversation of its own, which decides who has to
+    // clear up if it does not work out.
+    let opening = matches!(cli.command, Command::Invite { .. } | Command::Join { .. });
+
+    let (paths, minted) = match cli.paths()? {
+        Some(paths) => (paths, false),
+        None if opening => (cli.new_session()?, true),
         None => return Err(no_session()),
     };
 
+    let result = dispatch(cli, paths.clone()).await;
+
+    // A conversation that never started should leave nothing behind. Without this, every
+    // failed join left a session directory and a daemon serving nobody — which is how a
+    // machine ends up with twenty of them.
+    if minted && result.is_err() {
+        end_session(&paths).await.ok();
+    }
+    result
+}
+
+async fn dispatch(cli: Cli, paths: Paths) -> Result<ExitCode> {
     // Reject a mistyped code before going to the trouble of starting a daemon: the
     // failure should name the real problem, and cost nothing.
     if let Command::Join { code, .. } = &cli.command {
@@ -413,7 +426,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
         Command::Peer { action } => run_peer(&paths, action).await,
 
-        // Handled above, before a session was required.
+        // Handled in `run`, before a session was required.
         Command::Whoami { .. } | Command::Sessions { .. } => unreachable!(),
 
         Command::Invite {
