@@ -189,6 +189,149 @@ async fn a_departure_is_reported_by_status() {
 }
 
 #[tokio::test]
+async fn manual_mode_is_enforced_by_the_daemon_not_the_cli() {
+    use agent2agent::ipc::{Request, ResponseData};
+
+    // Manual is the default, so a plain send must be held even when the request comes
+    // straight off the socket rather than through the CLI.
+    let (claude, codex) = linked_pair("claude", "codex").await;
+
+    let data = claude
+        .daemon
+        .handle(Request::Send {
+            peer: None,
+            body: "unapproved".into(),
+            kind: Kind::Msg,
+            confirmed: false,
+        })
+        .await
+        .into_data()
+        .unwrap();
+    assert_eq!(
+        data,
+        ResponseData::NeedsApproval {
+            peer: "codex".into()
+        }
+    );
+    assert!(
+        codex
+            .daemon
+            .inbox()
+            .pop_wait(None, std::time::Duration::from_millis(300))
+            .await
+            .is_none(),
+        "nothing may reach the peer without approval"
+    );
+
+    // With approval it goes.
+    let data = claude
+        .daemon
+        .handle(Request::Send {
+            peer: None,
+            body: "approved".into(),
+            kind: Kind::Msg,
+            confirmed: true,
+        })
+        .await
+        .into_data()
+        .unwrap();
+    assert!(matches!(data, ResponseData::Sent { .. }));
+    let got = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();
+    assert_eq!(got.body, "approved");
+}
+
+#[tokio::test]
+async fn auto_mode_sends_without_asking() {
+    use agent2agent::config::{Mode, Peers};
+    use agent2agent::ipc::{Request, ResponseData};
+
+    let (claude, codex) = linked_pair("claude", "codex").await;
+
+    let mut peers = Peers::load(&claude.paths.peers()).unwrap();
+    peers.mode = Mode::Auto;
+    peers.save(&claude.paths.peers()).unwrap();
+    claude.daemon.reload_peers().await.unwrap();
+
+    let data = claude
+        .daemon
+        .handle(Request::Send {
+            peer: None,
+            body: "straight through".into(),
+            kind: Kind::Msg,
+            confirmed: false,
+        })
+        .await
+        .into_data()
+        .unwrap();
+    assert!(matches!(data, ResponseData::Sent { .. }));
+
+    let got = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();
+    assert_eq!(got.body, "straight through");
+}
+
+#[tokio::test]
+async fn control_signals_are_not_held_for_approval() {
+    use agent2agent::ipc::{Request, ResponseData};
+
+    // A goodbye that waited for approval could never be delivered, and neither carries
+    // content the operator needs to vet.
+    let (claude, codex) = linked_pair("claude", "codex").await;
+
+    for kind in [Kind::Hello, Kind::Bye] {
+        let data = claude
+            .daemon
+            .handle(Request::Send {
+                peer: None,
+                body: String::new(),
+                kind,
+                confirmed: false,
+            })
+            .await
+            .into_data()
+            .unwrap();
+        assert!(
+            matches!(data, ResponseData::Sent { .. }),
+            "{kind:?} should not need approval, got {data:?}"
+        );
+    }
+
+    let got = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();
+    assert_eq!(got.kind, Kind::Hello);
+}
+
+#[tokio::test]
+async fn a_departed_peer_is_reported_as_an_outcome_not_a_failure() {
+    use agent2agent::ipc::{Request, ResponseData};
+
+    let (claude, codex) = linked_pair("claude", "codex").await;
+    codex.daemon.send_kind(None, Kind::Bye, "").await.unwrap();
+    claude
+        .daemon
+        .inbox()
+        .pop_wait(None, PATIENCE)
+        .await
+        .unwrap();
+
+    let data = claude
+        .daemon
+        .handle(Request::Send {
+            peer: None,
+            body: "hello?".into(),
+            kind: Kind::Msg,
+            confirmed: true,
+        })
+        .await
+        .into_data()
+        .expect("a departed peer is an outcome, not an error");
+    assert_eq!(
+        data,
+        ResponseData::PeerGone {
+            peer: "codex".into()
+        }
+    );
+}
+
+#[tokio::test]
 async fn a_fresh_session_considers_everyone_present() {
     // Nobody has said they left, so writing is allowed.
     let (claude, _codex) = linked_pair("claude", "codex").await;

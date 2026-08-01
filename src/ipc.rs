@@ -32,6 +32,13 @@ pub enum Request {
         /// Conversation, an arrival, or a departure.
         #[serde(default)]
         kind: Kind,
+        /// The operator has already approved this message.
+        ///
+        /// Manual mode is enforced here rather than in the CLI: it is the default posture,
+        /// and a guard only the CLI applies is bypassed by anything else that opens the
+        /// socket.
+        #[serde(default)]
+        confirmed: bool,
     },
     /// Take one message from the inbox, waiting up to `wait_ms`.
     Recv {
@@ -102,6 +109,10 @@ impl Response {
 pub enum ResponseData {
     /// A message was accepted by the peer.
     Sent { peer: String, id: String },
+    /// Manual mode: nothing was sent, the operator has to agree first.
+    NeedsApproval { peer: String },
+    /// Nothing was sent: that peer said goodbye and is not reading replies.
+    PeerGone { peer: String },
     /// A message was taken off the inbox.
     Message { message: Message },
     /// `recv` reached its deadline with nothing queued.
@@ -210,11 +221,13 @@ mod tests {
                 peer: Some("codex".into()),
                 body: "hello".into(),
                 kind: Kind::Msg,
+                confirmed: true,
             },
             Request::Send {
                 peer: None,
                 body: String::new(),
                 kind: Kind::Bye,
+                confirmed: true,
             },
             Request::Recv {
                 peer: None,
@@ -241,9 +254,13 @@ mod tests {
             peer: None,
             body: "hi".into(),
             kind: Kind::Msg,
+            confirmed: true,
         })
         .unwrap();
-        assert_eq!(json, r#"{"cmd":"send","body":"hi","kind":"msg"}"#);
+        assert_eq!(
+            json,
+            r#"{"cmd":"send","body":"hi","kind":"msg","confirmed":true}"#
+        );
     }
 
     #[test]
@@ -280,6 +297,12 @@ mod tests {
             }),
             Response::ok(ResponseData::Message { message }),
             Response::ok(ResponseData::NoMessage),
+            Response::ok(ResponseData::NeedsApproval {
+                peer: "codex".into(),
+            }),
+            Response::ok(ResponseData::PeerGone {
+                peer: "codex".into(),
+            }),
             Response::ok(ResponseData::Done),
             Response::ok(ResponseData::Status(StatusInfo {
                 id: "abc".into(),

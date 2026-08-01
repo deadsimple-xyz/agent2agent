@@ -132,10 +132,13 @@ pub struct Peer {
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
     /// The agents talk on their own. Nothing is held for approval.
-    #[default]
     Auto,
     /// Every message, in either direction, is shown to the operator and waits for a
     /// yes before it moves.
+    ///
+    /// The default, deliberately. Two agents with shell access talking unattended is
+    /// something you should have to ask for, not something you discover afterwards.
+    #[default]
     Manual,
 }
 
@@ -667,20 +670,20 @@ mod tests {
     }
 
     #[test]
-    fn mode_defaults_to_auto_and_survives_toml() {
+    fn mode_defaults_to_manual_and_survives_toml() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("peers.toml");
 
         let mut peers = Peers::default();
         assert_eq!(
             peers.mode,
-            Mode::Auto,
-            "agents talk freely unless told not to"
+            Mode::Manual,
+            "unattended agents must be opted into, not discovered afterwards"
         );
 
-        peers.mode = Mode::Manual;
+        peers.mode = Mode::Auto;
         peers.save(&path).unwrap();
-        assert_eq!(Peers::load(&path).unwrap().mode, Mode::Manual);
+        assert_eq!(Peers::load(&path).unwrap().mode, Mode::Auto);
     }
 
     #[test]
@@ -689,8 +692,9 @@ mod tests {
         let path = dir.path().join("peers.toml");
         std::fs::write(&path, "default = \"codex\"\n\n[peers.codex]\nid = \"x\"\n").unwrap();
 
+        // An older config with no mode gets the safe one, not the permissive one.
         let loaded = Peers::load(&path).unwrap();
-        assert_eq!(loaded.mode, Mode::Auto);
+        assert_eq!(loaded.mode, Mode::Manual);
     }
 
     #[test]

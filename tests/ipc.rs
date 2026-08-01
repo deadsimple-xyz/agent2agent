@@ -60,6 +60,7 @@ async fn send_and_receive_across_the_socket() {
             peer: None,
             body: "over the socket".into(),
             kind: Kind::Msg,
+            confirmed: true,
         },
     )
     .await
@@ -177,6 +178,7 @@ async fn sending_with_no_peers_configured_explains_what_to_do() {
             peer: None,
             body: "into the void".into(),
             kind: Kind::Msg,
+            confirmed: true,
         },
     )
     .await;
@@ -215,6 +217,7 @@ async fn reload_over_the_socket_picks_up_a_new_peer() {
             peer: None,
             body: "after reload".into(),
             kind: Kind::Msg,
+            confirmed: true,
         },
     )
     .await
@@ -398,6 +401,7 @@ async fn a_daemon_side_error_reaches_the_client_as_a_response() {
             peer: Some("ghost".into()),
             body: "hello".into(),
             kind: Kind::Msg,
+            confirmed: true,
         },
     )
     .await;

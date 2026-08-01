@@ -579,8 +579,30 @@ impl Daemon {
     /// Apply one CLI request.
     pub async fn handle(&self, request: Request) -> Response {
         match request {
-            Request::Send { peer, body, kind } => {
-                match self.send_kind(peer.as_deref(), kind, &body).await {
+            Request::Send {
+                peer,
+                body,
+                kind,
+                confirmed,
+            } => {
+                // Resolve first, so both refusals below can name the peer.
+                let name = match self.peers.read().await.resolve(peer.as_deref()) {
+                    Ok((name, _)) => name,
+                    Err(e) => return Response::error(format!("{e:#}")),
+                };
+
+                // Ordinary messages only: hello and bye are control signals, and a
+                // departure that needed approval could never be delivered.
+                if kind == Kind::Msg {
+                    if self.departed.read().await.contains(&name) {
+                        return Response::ok(ResponseData::PeerGone { peer: name });
+                    }
+                    if !confirmed && self.peers.read().await.mode.is_manual() {
+                        return Response::ok(ResponseData::NeedsApproval { peer: name });
+                    }
+                }
+
+                match self.send_kind(Some(&name), kind, &body).await {
                     Ok((peer, id)) => Response::ok(ResponseData::Sent { peer, id }),
                     Err(e) => Response::error(format!("{e:#}")),
                 }

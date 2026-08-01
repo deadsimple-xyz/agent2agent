@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 
 use crate::config::{load_or_create_secret_key, Identity, Mode, Paths, Peers};
 use crate::daemon;
-use crate::ipc::{self, Request, Response, ResponseData};
+use crate::ipc::{self, Request, ResponseData};
 use crate::pairing::InviteCode;
 use crate::render::{render_incoming, render_json, render_outgoing, IN};
 use crate::wire::Kind;
@@ -335,7 +335,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             ttl,
         } => {
             let name = resolve_name(&paths, name)?;
-            let greeting = greeting.unwrap_or_else(|| format!("hey, what's up — {name} here"));
+            let greeting = greeting.unwrap_or_else(|| format!("Hey, {name} here. What's up?"));
 
             let response = ipc::request(
                 &paths.socket(),
@@ -405,43 +405,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             message,
         } => {
             let body = collect_message(message)?;
-
-            // In manual mode nothing leaves without the operator seeing it first.
-            if !confirm && current_mode(&paths).await?.is_manual() {
-                let target = to.as_deref().unwrap_or("the default peer");
-                let preview = render_outgoing(target, &body);
-
-                match ask_terminal(&preview, "Send this?") {
-                    Approval::Granted => {}
-                    Approval::Declined => {
-                        eprintln!("not sent");
-                        return Ok(ExitCode::from(EXIT_DECLINED));
-                    }
-                    Approval::NoTerminal => {
-                        // Nobody at a terminal — which is the normal case when an agent
-                        // runs this. Hand the decision back for the operator to make in
-                        // the chat, and let the agent re-run once they agree.
-                        eprintln!("{preview}");
-                        eprintln!(
-                            "\nmanual mode: this was NOT sent. Show it to your user, and \
-                             only if they agree, re-run the same command with --confirm."
-                        );
-                        return Ok(ExitCode::from(EXIT_NEEDS_APPROVAL));
-                    }
-                }
-            }
-
-            deliver(&paths, to, Kind::Msg, &body).await
+            deliver(&paths, to, Kind::Msg, &body, confirm).await
         }
 
         Command::Hello { to, message } => {
             let body = optional_message(message);
-            deliver(&paths, to, Kind::Hello, &body).await
+            deliver(&paths, to, Kind::Hello, &body, true).await
         }
 
         Command::Bye { to, message } => {
             let body = optional_message(message);
-            deliver(&paths, to, Kind::Bye, &body).await
+            deliver(&paths, to, Kind::Bye, &body, true).await
         }
 
         Command::Recv { from, wait, json } => {
@@ -608,45 +582,70 @@ fn resolve_name(paths: &Paths, given: Option<String>) -> Result<String> {
 }
 
 /// Send one message and report it, mapping a departed peer to its own exit code.
-async fn deliver(paths: &Paths, to: Option<String>, kind: Kind, body: &str) -> Result<ExitCode> {
+async fn deliver(
+    paths: &Paths,
+    to: Option<String>,
+    kind: Kind,
+    body: &str,
+    confirmed: bool,
+) -> Result<ExitCode> {
     let response = ipc::request(
         &paths.socket(),
         &Request::Send {
             peer: to,
             body: body.to_string(),
             kind,
+            confirmed,
         },
         daemon_send_timeout(),
     )
-    .await;
+    .await?;
 
-    let response = match response {
-        Ok(response) => response,
-        Err(e) => return Err(e),
-    };
+    match response.into_data()? {
+        ResponseData::Sent { peer, id: _ } => {
+            let shown = match kind {
+                Kind::Msg => body.to_string(),
+                Kind::Hello if body.is_empty() => "(hello)".to_string(),
+                Kind::Bye if body.is_empty() => "(disconnecting)".to_string(),
+                Kind::Hello => format!("(hello) {body}"),
+                Kind::Bye => format!("(disconnecting) {body}"),
+            };
+            eprintln!("{}", render_outgoing(&peer, &shown));
+            Ok(ExitCode::SUCCESS)
+        }
 
-    match response {
-        Response::Ok { data } => match data {
-            ResponseData::Sent { peer, id: _ } => {
-                let shown = match kind {
-                    Kind::Msg => body.to_string(),
-                    Kind::Hello if body.is_empty() => "(hello)".to_string(),
-                    Kind::Bye if body.is_empty() => "(disconnecting)".to_string(),
-                    Kind::Hello => format!("(hello) {body}"),
-                    Kind::Bye => format!("(disconnecting) {body}"),
-                };
-                eprintln!("{}", render_outgoing(&peer, &shown));
-                Ok(ExitCode::SUCCESS)
+        ResponseData::NeedsApproval { peer } => {
+            let preview = render_outgoing(&peer, body);
+
+            // If somebody is at a terminal, ask them here and now.
+            match ask_terminal(&preview, "Send this?") {
+                Approval::Granted => Box::pin(deliver(paths, Some(peer), kind, body, true)).await,
+                Approval::Declined => {
+                    eprintln!("not sent");
+                    Ok(ExitCode::from(EXIT_DECLINED))
+                }
+                Approval::NoTerminal => {
+                    // The normal case when an agent runs this: hand the decision back so
+                    // the operator can make it in the chat.
+                    eprintln!("{preview}");
+                    eprintln!(
+                        "\nmanual mode: this was NOT sent. Show it to your user, and only \
+                         if they agree, re-run the same command with --confirm."
+                    );
+                    Ok(ExitCode::from(EXIT_NEEDS_APPROVAL))
+                }
             }
-            other => bail!("unexpected reply from the daemon: {other:?}"),
-        },
-        // A refusal because the peer left is an outcome, not a malfunction: give it a
-        // code the caller can branch on instead of a generic failure.
-        Response::Error { message } if message.contains("has disconnected") => {
-            eprintln!("{message}");
+        }
+
+        ResponseData::PeerGone { peer } => {
+            eprintln!(
+                "{peer} has disconnected and is not reading replies; reopen with \
+                 `agent2agent hello --to {peer}` if you think they are back"
+            );
             Ok(ExitCode::from(EXIT_PEER_GONE))
         }
-        Response::Error { message } => bail!(message),
+
+        other => bail!("unexpected reply from the daemon: {other:?}"),
     }
 }
 
