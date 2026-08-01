@@ -207,7 +207,7 @@ async fn a_large_message_within_the_frame_limit_survives() {
 async fn unicode_and_control_characters_round_trip_unchanged() {
     let (claude, codex) = linked_pair("claude", "codex").await;
 
-    let body = "привет 🌍\ttabbed\nnewline\r\n\"quoted\" \\backslash\\ \u{0007}";
+    let body = "grüße 🌍 こんにちは\ttabbed\nnewline\r\n\"quoted\" \\backslash\\ \u{0007}";
     claude.daemon.send(None, body).await.unwrap();
 
     let got = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();

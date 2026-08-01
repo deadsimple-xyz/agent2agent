@@ -268,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_roundtrip() {
-        let msg = WireMsg::new("привет");
+        let msg = WireMsg::new("grüße 🌍 こんにちは");
         let mut buf = Vec::new();
         write_json(&mut buf, &msg).await.unwrap();
 

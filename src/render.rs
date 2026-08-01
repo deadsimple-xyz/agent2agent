@@ -101,8 +101,8 @@ mod tests {
     fn incoming_is_the_message_and_nothing_else() {
         // What lands on stdout is what the user should see quoted, with no words of ours
         // mixed in.
-        let rendered = render_incoming(&msg("Что ты думаешь о Трампе?"));
-        assert_eq!(rendered, ">>> Что ты думаешь о Трампе?");
+        let rendered = render_incoming(&msg("so who was the better doctor?"));
+        assert_eq!(rendered, ">>> so who was the better doctor?");
     }
 
     #[test]
