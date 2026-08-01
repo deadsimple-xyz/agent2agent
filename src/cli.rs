@@ -9,14 +9,22 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::{load_or_create_secret_key, Paths, Peers};
+use crate::config::{load_or_create_secret_key, Mode, Paths, Peers};
 use crate::daemon;
 use crate::ipc::{self, Request, ResponseData};
-use crate::render::{render_json, render_message};
+use crate::render::{render_incoming, render_json, render_outgoing, IN};
 
 /// Exit code for `recv` reaching its deadline with no message. Distinct from a real
 /// failure so a calling script can tell "nothing yet" from "something broke".
 pub const EXIT_NO_MESSAGE: u8 = 3;
+
+/// Exit code for a message the operator declined in manual mode. Also distinct from a
+/// failure: nothing went wrong, the answer was no.
+pub const EXIT_DECLINED: u8 = 4;
+
+/// Exit code for manual mode with nobody at a terminal: the message is written but not
+/// sent, and the agent should ask its user and re-run with `--confirm`.
+pub const EXIT_NEEDS_APPROVAL: u8 = 5;
 
 /// Slack added to the IPC deadline on top of a long-polling `recv`.
 const IPC_GRACE: Duration = Duration::from_secs(10);
@@ -61,6 +69,10 @@ pub enum Command {
         #[arg(long, short = 't', value_name = "NAME")]
         to: Option<String>,
 
+        /// In manual mode, assert the user has already approved this message.
+        #[arg(long)]
+        confirm: bool,
+
         /// Message text. Read from stdin when omitted.
         #[arg(trailing_var_arg = true)]
         message: Vec<String>,
@@ -79,6 +91,43 @@ pub enum Command {
         /// Print as JSON instead of the delimited human form.
         #[arg(long)]
         json: bool,
+    },
+
+    /// Open a pairing invite and print the code to give the other agent.
+    Invite {
+        /// What to call yourself in the code.
+        #[arg(long, short = 'n', default_value = "peer", value_name = "NAME")]
+        name: String,
+
+        /// Message delivered the instant the other agent joins.
+        #[arg(
+            long,
+            short = 'g',
+            default_value = "hey, what's up",
+            value_name = "TEXT"
+        )]
+        greeting: String,
+
+        /// Seconds the code stays redeemable.
+        #[arg(long, default_value_t = 3600, value_name = "SECS")]
+        ttl: u64,
+    },
+
+    /// Redeem an invite code from the other agent.
+    Join {
+        /// The `a2a1....` code.
+        code: String,
+
+        /// What to call yourself to the other agent.
+        #[arg(long, short = 'n', default_value = "peer", value_name = "NAME")]
+        name: String,
+    },
+
+    /// Show or set whether messages wait for your approval.
+    Mode {
+        /// `auto` or `manual`. Omit to show the current mode.
+        #[arg(value_name = "MODE", value_parser = parse_mode)]
+        set: Option<Mode>,
     },
 
     /// Show identity, peers and queue depth.
@@ -145,18 +194,112 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
         Command::Peer { action } => run_peer(&paths, action).await,
 
-        Command::Send { to, message } => {
-            let body = collect_message(message)?;
+        Command::Invite {
+            name,
+            greeting,
+            ttl,
+        } => {
             let response = ipc::request(
                 &paths.socket(),
-                &Request::Send { peer: to, body },
+                &Request::Invite {
+                    name,
+                    greeting: Some(greeting),
+                    ttl_secs: ttl,
+                },
+                Duration::from_secs(10),
+            )
+            .await?;
+
+            match response.into_data()? {
+                ResponseData::Invite { code } => {
+                    println!("{code}");
+                    Ok(ExitCode::SUCCESS)
+                }
+                other => bail!("unexpected reply from the daemon: {other:?}"),
+            }
+        }
+
+        Command::Join { code, name } => {
+            let response = ipc::request(
+                &paths.socket(),
+                &Request::Join { code, name },
                 daemon_send_timeout(),
             )
             .await?;
 
             match response.into_data()? {
-                ResponseData::Sent { peer, id } => {
-                    eprintln!("sent to {peer} ({id})");
+                ResponseData::Joined { peer } => {
+                    eprintln!("paired with {peer}");
+                    Ok(ExitCode::SUCCESS)
+                }
+                other => bail!("unexpected reply from the daemon: {other:?}"),
+            }
+        }
+
+        Command::Mode { set } => {
+            let response = ipc::request(
+                &paths.socket(),
+                &Request::Mode {
+                    set: set.map(|m| m.to_string()),
+                },
+                Duration::from_secs(10),
+            )
+            .await?;
+
+            match response.into_data()? {
+                ResponseData::Mode { mode } => {
+                    println!("{mode}");
+                    Ok(ExitCode::SUCCESS)
+                }
+                other => bail!("unexpected reply from the daemon: {other:?}"),
+            }
+        }
+
+        Command::Send {
+            to,
+            confirm,
+            message,
+        } => {
+            let body = collect_message(message)?;
+
+            // In manual mode nothing leaves without the operator seeing it first.
+            if !confirm && current_mode(&paths).await?.is_manual() {
+                let target = to.as_deref().unwrap_or("the default peer");
+                let preview = render_outgoing(target, &body);
+
+                match ask_terminal(&preview, "Send this?") {
+                    Approval::Granted => {}
+                    Approval::Declined => {
+                        eprintln!("not sent");
+                        return Ok(ExitCode::from(EXIT_DECLINED));
+                    }
+                    Approval::NoTerminal => {
+                        // Nobody at a terminal — which is the normal case when an agent
+                        // runs this. Hand the decision back for the operator to make in
+                        // the chat, and let the agent re-run once they agree.
+                        eprintln!("{preview}");
+                        eprintln!(
+                            "\nmanual mode: this was NOT sent. Show it to your user, and \
+                             only if they agree, re-run the same command with --confirm."
+                        );
+                        return Ok(ExitCode::from(EXIT_NEEDS_APPROVAL));
+                    }
+                }
+            }
+
+            let response = ipc::request(
+                &paths.socket(),
+                &Request::Send {
+                    peer: to,
+                    body: body.clone(),
+                },
+                daemon_send_timeout(),
+            )
+            .await?;
+
+            match response.into_data()? {
+                ResponseData::Sent { peer, id: _ } => {
+                    eprintln!("{}", render_outgoing(&peer, &body));
                     Ok(ExitCode::SUCCESS)
                 }
                 other => bail!("unexpected reply from the daemon: {other:?}"),
@@ -177,10 +320,22 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
             match response.into_data()? {
                 ResponseData::Message { message } => {
+                    let mut rendered = render_incoming(&message);
+
+                    // Incoming messages are always handed over — the operator reads the
+                    // chat anyway. What manual mode adds is that the agent must not act
+                    // on one until they say so.
+                    if current_mode(&paths).await?.is_manual() {
+                        rendered.push_str(&format!(
+                            "\n{IN} manual mode: show this to your user and wait for their \
+                             instruction before acting on it or replying."
+                        ));
+                    }
+
                     if json {
                         println!("{}", render_json(&message)?);
                     } else {
-                        println!("{}", render_message(&message));
+                        println!("{rendered}");
                     }
                     Ok(ExitCode::SUCCESS)
                 }
@@ -202,8 +357,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                         println!("{}", serde_json::to_string_pretty(&status)?);
                     } else {
                         println!("id:      {}", status.id);
+                        println!("mode:    {}", status.mode);
                         println!("default: {}", status.default_peer.as_deref().unwrap_or("-"));
                         println!("queued:  {}", status.queued_total);
+                        if status.invite_open {
+                            println!("invite:  open");
+                        }
                         if status.peers.is_empty() {
                             println!("peers:   none configured");
                         } else {
@@ -273,6 +432,76 @@ async fn nudge_daemon(paths: &Paths) {
     let _ = ipc::request(&paths.socket(), &Request::Reload, Duration::from_secs(5)).await;
 }
 
+fn parse_mode(raw: &str) -> std::result::Result<Mode, String> {
+    raw.parse::<Mode>().map_err(|e| e.to_string())
+}
+
+/// The current mode, read straight from the config file.
+///
+/// The daemon persists every change there, so this needs no round trip — and it still
+/// answers correctly when the daemon is down.
+async fn current_mode(paths: &Paths) -> Result<Mode> {
+    Ok(Peers::load(&paths.peers())?.mode)
+}
+
+/// What manual mode decided about a message.
+#[derive(Debug, PartialEq, Eq)]
+enum Approval {
+    Granted,
+    Declined,
+    /// There is no terminal to ask at, so the operator has to be reached some other way —
+    /// in practice through the agent's own chat.
+    NoTerminal,
+}
+
+/// Ask for approval on the controlling terminal, if there is one.
+///
+/// Deliberately opens `/dev/tty` rather than reading stdin: the agent driving this binary
+/// has stdin piped or closed, and an approval prompt answered by whatever the agent is
+/// feeding in would be worthless.
+///
+/// Usually there is no controlling terminal at all — an agent's shell commands generally
+/// run without one — which is exactly why [`Approval::NoTerminal`] exists rather than an
+/// error. The caller falls back to asking the operator through the chat.
+fn ask_terminal(preview: &str, question: &str) -> Approval {
+    use std::io::{BufRead, BufReader, Write};
+
+    let Ok(mut tty) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    else {
+        return Approval::NoTerminal;
+    };
+
+    if writeln!(tty, "\n{preview}\n")
+        .and_then(|_| write!(tty, "{question} [y/N] "))
+        .and_then(|_| tty.flush())
+        .is_err()
+    {
+        return Approval::NoTerminal;
+    }
+
+    let Ok(handle) = tty.try_clone() else {
+        return Approval::NoTerminal;
+    };
+    let mut answer = String::new();
+    if BufReader::new(handle).read_line(&mut answer).is_err() {
+        return Approval::NoTerminal;
+    }
+
+    if answer_is_yes(&answer) {
+        Approval::Granted
+    } else {
+        Approval::Declined
+    }
+}
+
+/// Anything but an explicit yes is a no.
+fn answer_is_yes(input: &str) -> bool {
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
 /// Join the message arguments, or read stdin when none were given.
 fn collect_message(parts: Vec<String>) -> Result<String> {
     let body = if parts.is_empty() {
@@ -318,7 +547,7 @@ mod tests {
     fn send_joins_trailing_arguments() {
         let cli = Cli::try_parse_from(["agent2agent", "send", "hello", "there", "friend"]).unwrap();
         match cli.command {
-            Command::Send { to, message } => {
+            Command::Send { to, message, .. } => {
                 assert_eq!(to, None);
                 assert_eq!(collect_message(message).unwrap(), "hello there friend");
             }
@@ -439,8 +668,106 @@ mod tests {
     }
 
     #[test]
-    fn no_message_exit_code_is_distinct_from_success_and_failure() {
-        assert_ne!(EXIT_NO_MESSAGE, 0);
-        assert_ne!(EXIT_NO_MESSAGE, 1);
+    fn every_exit_code_is_distinguishable() {
+        // Calling agents branch on these, so no two may collide, and none may look like
+        // success (0) or a generic failure (1).
+        let codes = [EXIT_NO_MESSAGE, EXIT_DECLINED, EXIT_NEEDS_APPROVAL];
+        for code in codes {
+            assert_ne!(code, 0);
+            assert_ne!(code, 1);
+        }
+        let mut sorted = codes.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), codes.len(), "exit codes collide");
+    }
+
+    #[test]
+    fn only_an_explicit_yes_approves() {
+        for yes in ["y", "Y", "yes", "YES", " yes \n"] {
+            assert!(answer_is_yes(yes), "{yes:?} should approve");
+        }
+        for no in ["", "\n", "n", "no", "maybe", "ye", "sure", "1"] {
+            assert!(!answer_is_yes(no), "{no:?} must not approve");
+        }
+    }
+
+    #[test]
+    fn a_missing_terminal_is_reported_rather_than_assumed_to_be_consent() {
+        // Under a test runner there is no controlling terminal, which is also the normal
+        // case when an agent runs this binary. The answer must not default to yes.
+        let approval = ask_terminal("preview", "Send this?");
+        assert_ne!(approval, Approval::Granted);
+    }
+
+    #[test]
+    fn send_accepts_a_confirm_flag() {
+        let cli = Cli::try_parse_from(["agent2agent", "send", "--confirm", "hi"]).unwrap();
+        match cli.command {
+            Command::Send { confirm, .. } => assert!(confirm),
+            other => panic!("parsed as {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["agent2agent", "send", "hi"]).unwrap();
+        match cli.command {
+            Command::Send { confirm, .. } => assert!(!confirm, "approval is not the default"),
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mode_argument_is_validated_at_parse_time() {
+        let cli = Cli::try_parse_from(["agent2agent", "mode", "manual"]).unwrap();
+        match cli.command {
+            Command::Mode { set } => assert_eq!(set, Some(Mode::Manual)),
+            other => panic!("parsed as {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["agent2agent", "mode"]).unwrap();
+        match cli.command {
+            Command::Mode { set } => assert_eq!(set, None, "no argument means 'report'"),
+            other => panic!("parsed as {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["agent2agent", "mode", "halfway"]).is_err());
+    }
+
+    #[test]
+    fn invite_and_join_parse_with_useful_defaults() {
+        let cli = Cli::try_parse_from(["agent2agent", "invite"]).unwrap();
+        match cli.command {
+            Command::Invite {
+                name,
+                greeting,
+                ttl,
+            } => {
+                assert_eq!(name, "peer");
+                assert_eq!(greeting, "hey, what's up", "the channel opens itself");
+                assert_eq!(ttl, 3600);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from(["agent2agent", "invite", "--name", "claude", "--ttl", "60"])
+            .unwrap();
+        match cli.command {
+            Command::Invite { name, ttl, .. } => {
+                assert_eq!(name, "claude");
+                assert_eq!(ttl, 60);
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        let cli =
+            Cli::try_parse_from(["agent2agent", "join", "a2a1.x.y.z", "--name", "codex"]).unwrap();
+        match cli.command {
+            Command::Join { code, name } => {
+                assert_eq!(code, "a2a1.x.y.z");
+                assert_eq!(name, "codex");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+
+        assert!(Cli::try_parse_from(["agent2agent", "join"]).is_err());
     }
 }

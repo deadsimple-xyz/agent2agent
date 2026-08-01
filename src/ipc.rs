@@ -36,8 +36,30 @@ pub enum Request {
         #[serde(default)]
         wait_ms: u64,
     },
+    /// Open a pairing invite and return the code to hand to the other agent.
+    Invite {
+        /// What we call ourselves in the code.
+        name: String,
+        /// Message delivered to the joiner the moment pairing succeeds.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        greeting: Option<String>,
+        #[serde(default)]
+        ttl_secs: u64,
+    },
+    /// Redeem an invite code produced by the other agent.
+    Join {
+        code: String,
+        /// What we call ourselves to the inviter.
+        name: String,
+    },
     /// Report identity, peers and queue depth.
     Status,
+    /// Read or change whether messages wait for operator approval.
+    Mode {
+        /// Absent means "report the current mode".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        set: Option<String>,
+    },
     /// Re-read `peers.toml` from disk.
     Reload,
 }
@@ -80,6 +102,12 @@ pub enum ResponseData {
     Message { message: Message },
     /// `recv` reached its deadline with nothing queued.
     NoMessage,
+    /// An invite was opened.
+    Invite { code: String },
+    /// An invite was redeemed; `peer` is the local name of the other agent.
+    Joined { peer: String },
+    /// The current mode, after any change.
+    Mode { mode: String },
     /// Daemon state.
     Status(StatusInfo),
     /// Acknowledgement with nothing to report.
@@ -96,6 +124,12 @@ pub struct StatusInfo {
     /// Default peer, if set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_peer: Option<String>,
+    /// `auto` or `manual`.
+    #[serde(default)]
+    pub mode: String,
+    /// Whether an invite is currently redeemable.
+    #[serde(default)]
+    pub invite_open: bool,
     /// Queued messages per peer.
     pub queued: BTreeMap<String, usize>,
     /// Total queued messages.
@@ -240,6 +274,8 @@ mod tests {
                 id: "abc".into(),
                 peers: BTreeMap::from([("codex".to_string(), "xyz".to_string())]),
                 default_peer: Some("codex".into()),
+                mode: "auto".into(),
+                invite_open: true,
                 queued: BTreeMap::from([("codex".to_string(), 2)]),
                 queued_total: 2,
             })),

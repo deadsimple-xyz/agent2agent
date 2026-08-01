@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use iroh::endpoint::{presets, Connection, Incoming, RecvStream, SendStream, VarInt};
 use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -16,13 +16,33 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::config::{load_or_create_secret_key, Paths, Peers};
+use crate::config::{load_or_create_secret_key, Mode, Paths, Peers};
 use crate::inbox::{Inbox, Message};
 use crate::ipc::{self, Request, Response, ResponseData, StatusInfo};
+use crate::pairing::{
+    tokens_match, InviteCode, JoinRequest, JoinResponse, DEFAULT_TTL_SECS, PAIR_ALPN, TOKEN_BYTES,
+};
+use crate::util::random_hex;
 use crate::wire::{read_json, write_json, Ack, WireMsg, ALPN, PROTOCOL_VERSION};
 
 /// QUIC close code for a connection from an endpoint id we do not know.
 const CLOSE_UNAUTHORIZED: u32 = 1;
+
+/// How long the inviter holds a pairing connection open after replying, waiting for the
+/// joiner to hang up.
+const HANDSHAKE_LINGER: Duration = Duration::from_secs(10);
+
+/// An invite waiting to be redeemed. At most one is outstanding at a time: a second
+/// `invite` replaces the first, so a code left lying around stops working.
+#[derive(Debug, Clone)]
+struct PendingInvite {
+    token: String,
+    /// What we call ourselves in the code, echoed back to the joiner.
+    my_name: String,
+    /// Sent to the joiner the moment pairing succeeds, so the conversation opens itself.
+    greeting: Option<String>,
+    expires_at: tokio::time::Instant,
+}
 
 /// Tunables. The defaults are what the daemon runs with; tests shorten the timeout so a
 /// deliberately unreachable peer does not cost half a minute of wall clock.
@@ -51,6 +71,8 @@ pub struct Daemon {
     inbox: Arc<Inbox>,
     peers: RwLock<Peers>,
     options: Options,
+    /// The outstanding invite, if `invite` has been run and not yet redeemed.
+    invite: Mutex<Option<PendingInvite>>,
     /// Live outbound connections, keyed by peer. Reused so that only the first message
     /// to a peer pays for hole punching.
     connections: Mutex<HashMap<EndpointId, Connection>>,
@@ -77,6 +99,7 @@ impl Daemon {
             inbox: Arc::new(Inbox::new(options.inbox_capacity)),
             peers: RwLock::new(peers),
             options,
+            invite: Mutex::new(None),
             connections: Mutex::new(HashMap::new()),
         })
     }
@@ -120,6 +143,15 @@ impl Daemon {
                 return;
             }
         };
+
+        // Pairing runs on its own ALPN and is the one path that does not require the
+        // caller to be on the peer list — it is how callers get onto it.
+        if connection.alpn() == PAIR_ALPN {
+            if let Err(e) = self.handle_pairing(connection).await {
+                warn!(error = %e, "pairing attempt failed");
+            }
+            return;
+        }
 
         // Authorization. iroh has already proved the remote holds the private key for
         // this id; the only question left is whether we chose to talk to it.
@@ -195,6 +227,207 @@ impl Daemon {
         let _ = send.finish();
         info!(peer = %peer_name, id = %message.id, "message received");
         Ok(())
+    }
+
+    // ---------------------------------------------------------------- pairing
+
+    /// Open an invite and return the code to hand to the other agent.
+    ///
+    /// Only one invite is outstanding at a time; opening a new one silently retires the
+    /// previous code.
+    pub async fn create_invite(
+        &self,
+        my_name: &str,
+        greeting: Option<String>,
+        ttl: Duration,
+    ) -> Result<String> {
+        crate::config::validate_name(my_name)?;
+        let token = random_hex(TOKEN_BYTES);
+        let code = InviteCode {
+            name: my_name.to_string(),
+            id: self.id().to_string(),
+            token: token.clone(),
+        };
+
+        *self.invite.lock().await = Some(PendingInvite {
+            token,
+            my_name: my_name.to_string(),
+            greeting,
+            expires_at: tokio::time::Instant::now() + ttl,
+        });
+        Ok(code.encode())
+    }
+
+    /// Whether an invite is currently redeemable.
+    pub async fn invite_is_open(&self) -> bool {
+        match self.invite.lock().await.as_ref() {
+            Some(pending) => tokio::time::Instant::now() < pending.expires_at,
+            None => false,
+        }
+    }
+
+    async fn handle_pairing(self: Arc<Self>, connection: Connection) -> Result<()> {
+        let remote = connection.remote_id();
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        let request: JoinRequest = read_json(&mut recv)
+            .await?
+            .context("joiner opened a pairing stream and sent nothing")?;
+
+        let outcome = self
+            .redeem_invite(&request.token, remote, &request.name)
+            .await;
+
+        let paired = match &outcome {
+            Ok((my_name, peer_name, greeting)) => {
+                write_json(
+                    &mut send,
+                    &JoinResponse::Ok {
+                        name: my_name.clone(),
+                    },
+                )
+                .await?;
+                Some((peer_name.clone(), greeting.clone()))
+            }
+            Err(e) => {
+                warn!(remote = %remote, error = %e, "refused a pairing attempt");
+                write_json(
+                    &mut send,
+                    &JoinResponse::Error {
+                        message: e.to_string(),
+                    },
+                )
+                .await?;
+                None
+            }
+        };
+        let _ = send.finish();
+
+        // Wait for the joiner to hang up before letting this connection drop. Dropping a
+        // QUIC connection discards anything still in flight, which would lose the reply
+        // we just wrote.
+        let _ = tokio::time::timeout(HANDSHAKE_LINGER, connection.closed()).await;
+
+        if let Some((peer_name, greeting)) = paired {
+            info!(peer = %peer_name, "paired");
+
+            // Open the conversation so the joiner finds something already waiting
+            // instead of an empty channel. The joiner authorized us before dialling,
+            // so this is not a race.
+            if let Some(greeting) = greeting {
+                if let Err(e) = self.send(Some(&peer_name), &greeting).await {
+                    warn!(peer = %peer_name, error = %e, "could not deliver the opening message");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a token and, if it is good, record the caller as a peer.
+    ///
+    /// Returns our own name, the name we filed the caller under, and the opening message.
+    async fn redeem_invite(
+        &self,
+        token: &str,
+        remote: EndpointId,
+        preferred_name: &str,
+    ) -> Result<(String, String, Option<String>)> {
+        let pending = {
+            let mut slot = self.invite.lock().await;
+            let Some(pending) = slot.clone() else {
+                bail!("no invite is open on this machine");
+            };
+            if tokio::time::Instant::now() >= pending.expires_at {
+                *slot = None;
+                bail!("the invite has expired");
+            }
+            if !tokens_match(&pending.token, token) {
+                bail!("invite token does not match");
+            }
+            // Burn it: an invite is good for exactly one pairing.
+            *slot = None;
+            pending
+        };
+
+        let peer_name = {
+            let mut peers = self.peers.write().await;
+            let name = peers.add_paired(preferred_name, &remote)?;
+            peers.save(&self.paths.peers())?;
+            name
+        };
+        Ok((pending.my_name, peer_name, pending.greeting))
+    }
+
+    /// Redeem someone else's invite code. Returns the name we filed them under.
+    pub async fn join(&self, raw_code: &str, my_name: &str) -> Result<String> {
+        crate::config::validate_name(my_name)?;
+        let code = InviteCode::decode(raw_code)?;
+        let inviter = crate::config::parse_endpoint_id(&code.id)?;
+        if inviter == self.id() {
+            bail!("that invite code was produced by this machine — it is for the other agent");
+        }
+
+        // Authorize the inviter *before* dialling: it sends an opening message the moment
+        // pairing succeeds, and an unauthorized inbound connection would be refused.
+        let (peer_name, was_already_known, addr) = {
+            let mut peers = self.peers.write().await;
+            let was_already_known = peers.name_for(&inviter).is_some();
+            let name = peers.add_paired(&code.name, &inviter)?;
+            peers.save(&self.paths.peers())?;
+            let addr = peers
+                .peers
+                .get(&name)
+                .expect("just inserted")
+                .endpoint_addr()?;
+            (name, was_already_known, addr)
+        };
+
+        match self.perform_join(addr, &code.token, my_name).await {
+            Ok(_) => Ok(peer_name),
+            Err(e) => {
+                // Leave no half-authorized peer behind, unless it predates this attempt.
+                if !was_already_known {
+                    let mut peers = self.peers.write().await;
+                    peers.remove(&peer_name);
+                    let _ = peers.save(&self.paths.peers());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    async fn perform_join(
+        &self,
+        inviter: EndpointAddr,
+        token: &str,
+        my_name: &str,
+    ) -> Result<String> {
+        let connect = self.endpoint.connect(inviter, PAIR_ALPN);
+        let connection = tokio::time::timeout(self.options.send_timeout, connect)
+            .await
+            .map_err(|_| anyhow!("timed out reaching the inviting agent"))?
+            .context("cannot reach the inviting agent")?;
+
+        let (mut send, mut recv) = connection.open_bi().await?;
+        write_json(
+            &mut send,
+            &JoinRequest {
+                v: PROTOCOL_VERSION,
+                token: token.to_string(),
+                name: my_name.to_string(),
+            },
+        )
+        .await?;
+        send.finish()?;
+
+        let response: JoinResponse = read_json(&mut recv)
+            .await?
+            .context("the inviting agent closed the stream without answering")?;
+        match response {
+            JoinResponse::Ok { name } => Ok(name),
+            JoinResponse::Error { message } => {
+                bail!("the inviting agent refused the invite code: {message}")
+            }
+        }
     }
 
     // --------------------------------------------------------------- outbound
@@ -317,7 +550,36 @@ impl Daemon {
                 }
             }
 
+            Request::Invite {
+                name,
+                greeting,
+                ttl_secs,
+            } => {
+                let ttl = Duration::from_secs(if ttl_secs == 0 {
+                    DEFAULT_TTL_SECS
+                } else {
+                    ttl_secs
+                });
+                match self.create_invite(&name, greeting, ttl).await {
+                    Ok(code) => Response::ok(ResponseData::Invite { code }),
+                    Err(e) => Response::error(format!("{e:#}")),
+                }
+            }
+
+            Request::Join { code, name } => match self.join(&code, &name).await {
+                Ok(peer) => Response::ok(ResponseData::Joined { peer }),
+                Err(e) => Response::error(format!("{e:#}")),
+            },
+
+            Request::Mode { set } => match self.set_or_report_mode(set.as_deref()).await {
+                Ok(mode) => Response::ok(ResponseData::Mode {
+                    mode: mode.to_string(),
+                }),
+                Err(e) => Response::error(format!("{e:#}")),
+            },
+
             Request::Status => {
+                let invite_open = self.invite_is_open().await;
                 let peers = self.peers.read().await;
                 Response::ok(ResponseData::Status(StatusInfo {
                     id: self.id().to_string(),
@@ -327,6 +589,8 @@ impl Daemon {
                         .map(|(name, peer)| (name.clone(), peer.id.clone()))
                         .collect(),
                     default_peer: peers.default.clone(),
+                    mode: peers.mode.to_string(),
+                    invite_open,
                     queued: self.inbox.counts(),
                     queued_total: self.inbox.len(),
                 }))
@@ -340,6 +604,21 @@ impl Daemon {
                 Err(e) => Response::error(format!("{e:#}")),
             },
         }
+    }
+
+    /// Report the mode, or change it and persist the change.
+    pub async fn set_or_report_mode(&self, set: Option<&str>) -> Result<Mode> {
+        let mut peers = self.peers.write().await;
+        if let Some(raw) = set {
+            peers.mode = raw.parse::<Mode>()?;
+            peers.save(&self.paths.peers())?;
+        }
+        Ok(peers.mode)
+    }
+
+    /// The current mode.
+    pub async fn mode(&self) -> Mode {
+        self.peers.read().await.mode
     }
 
     /// Re-read `peers.toml`. Returns how many peers are now configured.
@@ -393,7 +672,7 @@ impl Daemon {
 pub async fn build_endpoint(secret_key: SecretKey) -> Result<Endpoint> {
     Endpoint::builder(presets::N0)
         .secret_key(secret_key)
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), PAIR_ALPN.to_vec()])
         .bind()
         .await
         .context("binding the iroh endpoint")

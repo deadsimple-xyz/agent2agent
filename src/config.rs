@@ -123,12 +123,58 @@ pub struct Peer {
     pub addrs: Vec<String>,
 }
 
+/// Whether the operator is in the loop for every message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// The agents talk on their own. Nothing is held for approval.
+    #[default]
+    Auto,
+    /// Every message, in either direction, is shown to the operator and waits for a
+    /// yes before it moves.
+    Manual,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Auto => "auto",
+            Mode::Manual => "manual",
+        }
+    }
+
+    pub fn is_manual(self) -> bool {
+        matches!(self, Mode::Manual)
+    }
+}
+
+impl std::fmt::Display for Mode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(Mode::Auto),
+            "manual" => Ok(Mode::Manual),
+            other => bail!("unknown mode {other:?}, expected 'auto' or 'manual'"),
+        }
+    }
+}
+
 /// The contents of `peers.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peers {
     /// Peer used when `--to`/`--from` is omitted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<String>,
+    /// Whether messages wait for operator approval.
+    #[serde(default)]
+    pub mode: Mode,
     #[serde(default)]
     pub peers: BTreeMap<String, Peer>,
 }
@@ -179,6 +225,51 @@ impl Peers {
             self.default = Some(name.to_string());
         }
         Ok(())
+    }
+
+    /// Record a peer discovered through pairing, returning the name actually used.
+    ///
+    /// Unlike [`Self::add`] this never fails on a name clash: the operator is not typing
+    /// the name, the remote side chose it, so a collision with an unrelated existing peer
+    /// must not abort a pairing that is already half-complete. A taken name gets a
+    /// numeric suffix instead. Re-pairing with a peer already on file reuses its name.
+    pub fn add_paired(&mut self, preferred: &str, id: &EndpointId) -> Result<String> {
+        validate_name(preferred)?;
+        let id_text = id.to_string();
+
+        if let Some(existing) = self.name_for(id) {
+            self.peers.insert(
+                existing.clone(),
+                Peer {
+                    id: id_text,
+                    addrs: self
+                        .peers
+                        .get(&existing)
+                        .map(|p| p.addrs.clone())
+                        .unwrap_or_default(),
+                },
+            );
+            return Ok(existing);
+        }
+
+        let mut name = preferred.to_string();
+        let mut suffix = 2;
+        while self.peers.contains_key(&name) {
+            name = format!("{preferred}-{suffix}");
+            suffix += 1;
+        }
+
+        self.peers.insert(
+            name.clone(),
+            Peer {
+                id: id_text,
+                addrs: Vec::new(),
+            },
+        );
+        if self.default.is_none() {
+            self.default = Some(name.clone());
+        }
+        Ok(name)
     }
 
     /// Remove a peer. Returns whether it existed. Clears the default if it pointed here.
@@ -435,6 +526,99 @@ mod tests {
         peers.add("codex", &new_id).unwrap();
         assert_eq!(peers.peers["codex"].id, new_id);
         assert_eq!(peers.peers.len(), 1);
+    }
+
+    #[test]
+    fn mode_defaults_to_auto_and_survives_toml() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("peers.toml");
+
+        let mut peers = Peers::default();
+        assert_eq!(
+            peers.mode,
+            Mode::Auto,
+            "agents talk freely unless told not to"
+        );
+
+        peers.mode = Mode::Manual;
+        peers.save(&path).unwrap();
+        assert_eq!(Peers::load(&path).unwrap().mode, Mode::Manual);
+    }
+
+    #[test]
+    fn a_config_written_before_modes_existed_still_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("peers.toml");
+        std::fs::write(&path, "default = \"codex\"\n\n[peers.codex]\nid = \"x\"\n").unwrap();
+
+        let loaded = Peers::load(&path).unwrap();
+        assert_eq!(loaded.mode, Mode::Auto);
+    }
+
+    #[test]
+    fn mode_parses_from_text_case_insensitively() {
+        assert_eq!("auto".parse::<Mode>().unwrap(), Mode::Auto);
+        assert_eq!("MANUAL".parse::<Mode>().unwrap(), Mode::Manual);
+        assert_eq!(" manual \n".parse::<Mode>().unwrap(), Mode::Manual);
+        assert!("halfway".parse::<Mode>().is_err());
+        assert!("".parse::<Mode>().is_err());
+    }
+
+    #[test]
+    fn mode_round_trips_through_its_display_form() {
+        for mode in [Mode::Auto, Mode::Manual] {
+            assert_eq!(mode.to_string().parse::<Mode>().unwrap(), mode);
+        }
+        assert!(Mode::Manual.is_manual());
+        assert!(!Mode::Auto.is_manual());
+    }
+
+    #[test]
+    fn add_paired_uses_the_requested_name_when_it_is_free() {
+        let id = SecretKey::generate().public();
+        let mut peers = Peers::default();
+
+        let name = peers.add_paired("claude", &id).unwrap();
+        assert_eq!(name, "claude");
+        assert_eq!(peers.default.as_deref(), Some("claude"));
+        assert_eq!(peers.name_for(&id).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn add_paired_suffixes_around_an_unrelated_name_clash() {
+        // Pairing must not fail just because the operator already has a peer by that
+        // name — the remote side picked it, and the handshake is already half done.
+        let mut peers = Peers::default();
+        peers.add("claude", &some_id()).unwrap();
+
+        let newcomer = SecretKey::generate().public();
+        let name = peers.add_paired("claude", &newcomer).unwrap();
+        assert_eq!(name, "claude-2");
+        assert_eq!(peers.peers.len(), 2);
+        assert_eq!(peers.name_for(&newcomer).as_deref(), Some("claude-2"));
+
+        let third = SecretKey::generate().public();
+        assert_eq!(peers.add_paired("claude", &third).unwrap(), "claude-3");
+    }
+
+    #[test]
+    fn add_paired_reuses_the_name_of_a_peer_already_on_file() {
+        let id = SecretKey::generate().public();
+        let mut peers = Peers::default();
+        peers.add("codex", &id.to_string()).unwrap();
+
+        // Re-pairing with the same key must not create a duplicate under a new name.
+        let name = peers.add_paired("something-else", &id).unwrap();
+        assert_eq!(name, "codex");
+        assert_eq!(peers.peers.len(), 1);
+    }
+
+    #[test]
+    fn add_paired_rejects_an_unusable_name() {
+        let id = SecretKey::generate().public();
+        let mut peers = Peers::default();
+        assert!(peers.add_paired("has space", &id).is_err());
+        assert!(peers.peers.is_empty());
     }
 
     #[test]

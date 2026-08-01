@@ -29,6 +29,7 @@ pub mod config;
 pub mod daemon;
 pub mod inbox;
 pub mod ipc;
+pub mod pairing;
 pub mod render;
 pub mod util;
 pub mod wire;
