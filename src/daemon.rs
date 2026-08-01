@@ -20,9 +20,9 @@ use crate::config::{load_or_create_secret_key, Mode, Paths, Peers};
 use crate::inbox::{Inbox, Message};
 use crate::ipc::{self, Request, Response, ResponseData, StatusInfo};
 use crate::pairing::{
-    tokens_match, InviteCode, JoinRequest, JoinResponse, DEFAULT_TTL_SECS, PAIR_ALPN, TOKEN_BYTES,
+    is_newer, tokens_match, InviteCode, JoinRequest, JoinResponse, DEFAULT_TTL_SECS, PAIR_ALPN,
+    VERSION,
 };
-use crate::util::random_hex;
 use crate::wire::{read_json, write_json, Ack, Kind, WireMsg, ALPN, PROTOCOL_VERSION};
 
 /// QUIC close code for a connection from an endpoint id we do not know.
@@ -286,11 +286,12 @@ impl Daemon {
     ) -> Result<String> {
         crate::config::validate_name(my_name)?;
         self.wait_until_reachable().await;
-        let token = random_hex(TOKEN_BYTES);
+        let token = InviteCode::new_token();
         let code = InviteCode {
             name: my_name.to_string(),
-            id: self.id().to_string(),
+            id: InviteCode::encode_id(&self.id()),
             token: token.clone(),
+            version: Some(VERSION.to_string()),
         };
 
         *self.invite.lock().await = Some(PendingInvite {
@@ -436,8 +437,21 @@ impl Daemon {
     ) -> Result<String> {
         crate::config::validate_name(my_name)?;
         let code = InviteCode::decode(raw_code)?;
+
+        // A code minted by a newer build may assume arguments this one does not have, and
+        // both sides follow the same written guide. Better a plain "upgrade" than a guide
+        // describing flags the local binary will reject.
+        if let Some(theirs) = &code.version {
+            if is_newer(theirs, VERSION) {
+                bail!(
+                    "the other agent is on agent2agent {theirs} and this is {VERSION}; \
+                     upgrade first (`brew upgrade agent2agent`) and then join again"
+                );
+            }
+        }
+
         self.wait_until_reachable().await;
-        let inviter = crate::config::parse_endpoint_id(&code.id)?;
+        let inviter = code.endpoint_id()?;
         if inviter == self.id() {
             bail!("that invite code was produced by this machine — it is for the other agent");
         }

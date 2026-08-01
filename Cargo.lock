@@ -39,10 +39,11 @@ dependencies = [
 
 [[package]]
 name = "agent2agent"
-version = "0.2.7"
+version = "0.2.9"
 dependencies = [
  "anyhow",
  "clap",
+ "data-encoding",
  "iroh",
  "rand 0.9.5",
  "serde",

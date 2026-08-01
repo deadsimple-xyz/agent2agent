@@ -14,9 +14,11 @@
 //! peer list — necessarily, since the whole point is that the caller is not in it yet.
 
 use anyhow::{bail, Context, Result};
+use data_encoding::BASE64URL_NOPAD;
+use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{parse_endpoint_id, validate_name};
+use crate::config::validate_name;
 
 /// ALPN for the pairing handshake, distinct from the message ALPN so the accept loop can
 /// route on it and apply completely different admission rules.
@@ -26,36 +28,54 @@ pub const PAIR_ALPN: &[u8] = b"agent2agent/pair/1";
 const CODE_PREFIX: &str = "a2a1";
 
 /// Bytes of entropy in a pairing token.
-pub const TOKEN_BYTES: usize = 16;
+///
+/// 96 bits, redeemable once and only for an hour. The code is copied by hand between two
+/// chats, so every character of it is a character someone has to move.
+pub const TOKEN_BYTES: usize = 12;
 
 /// How long an invite stays redeemable by default.
 pub const DEFAULT_TTL_SECS: u64 = 3600;
 
+/// This build's version, carried in every code it mints.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The string a user copies from one agent's chat into another's.
 ///
-/// Wire form: `a2a1.<name>.<endpoint id>.<token>` — dot-separated, and none of the parts
-/// can contain a dot, so parsing is unambiguous.
+/// Wire form: `a2a1.<name>.<endpoint id>.<token>.<version>` — dot-separated, and none of
+/// the parts can contain a dot, so parsing is unambiguous. The version uses dashes for
+/// exactly that reason.
+///
+/// It rides along so the joiner can tell it is behind before anything mysterious happens:
+/// the two sides follow the same written guide, and a guide describing flags the local
+/// binary does not have is worse than a plain "upgrade first".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteCode {
     /// What the inviter calls itself; the joiner files it under this name.
     pub name: String,
-    /// The inviter's endpoint id, in hex.
+    /// The inviter's endpoint id, base64url. 43 characters instead of hex's 64.
     pub id: String,
-    /// Single-use token, in hex.
+    /// Single-use token, base64url.
     pub token: String,
+    /// The inviter's version. Absent in codes minted before this was carried.
+    pub version: Option<String>,
 }
 
 impl InviteCode {
     pub fn encode(&self) -> String {
-        format!("{CODE_PREFIX}.{}.{}.{}", self.name, self.id, self.token)
+        let mut out = format!("{CODE_PREFIX}.{}.{}.{}", self.name, self.id, self.token);
+        if let Some(version) = &self.version {
+            out.push('.');
+            out.push_str(&version.replace('.', "-"));
+        }
+        out
     }
 
     pub fn decode(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
         let parts: Vec<&str> = trimmed.split('.').collect();
-        if parts.len() != 4 {
+        if parts.len() < 4 || parts.len() > 5 {
             bail!(
-                "invite code should have 4 dot-separated parts, found {}",
+                "invite code should have 4 or 5 dot-separated parts, found {}",
                 parts.len()
             );
         }
@@ -63,21 +83,62 @@ impl InviteCode {
             bail!("not an agent2agent invite code (expected it to start with {CODE_PREFIX}.)");
         }
 
+        let version = match parts.get(4) {
+            None => None,
+            Some(raw) => {
+                if raw.is_empty() || !raw.chars().all(|c| c.is_ascii_digit() || c == '-') {
+                    bail!("invite code carries a malformed version {raw:?}");
+                }
+                Some(raw.replace('-', "."))
+            }
+        };
+
         let code = Self {
             name: parts[1].to_string(),
             id: parts[2].to_string(),
             token: parts[3].to_string(),
+            version,
         };
 
         // Validate every part now, so a mistyped code fails here with a clear message
         // rather than somewhere inside the dial.
         validate_name(&code.name).context("invite code carries an invalid peer name")?;
-        parse_endpoint_id(&code.id).context("invite code carries an invalid endpoint id")?;
-        if code.token.len() != TOKEN_BYTES * 2 || !code.token.chars().all(|c| c.is_ascii_hexdigit())
-        {
-            bail!("invite code carries a malformed token");
+        code.endpoint_id()
+            .context("invite code carries an invalid endpoint id")?;
+        let token = BASE64URL_NOPAD
+            .decode(code.token.as_bytes())
+            .map_err(|_| anyhow::anyhow!("invite code carries a malformed token"))?;
+        if token.len() != TOKEN_BYTES {
+            bail!(
+                "invite code carries a {} byte token, expected {TOKEN_BYTES}",
+                token.len()
+            );
         }
         Ok(code)
+    }
+
+    /// The inviter's key, decoded.
+    pub fn endpoint_id(&self) -> Result<EndpointId> {
+        let bytes = BASE64URL_NOPAD
+            .decode(self.id.as_bytes())
+            .map_err(|_| anyhow::anyhow!("endpoint id is not valid base64url"))?;
+        let bytes: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("endpoint id is {} bytes, expected 32", bytes.len()))?;
+        EndpointId::from_bytes(&bytes).map_err(|e| anyhow::anyhow!("{e}"))
+    }
+
+    /// Render a key for a code.
+    pub fn encode_id(id: &EndpointId) -> String {
+        BASE64URL_NOPAD.encode(id.as_bytes())
+    }
+
+    /// A fresh single-use token.
+    pub fn new_token() -> String {
+        let mut bytes = [0u8; TOKEN_BYTES];
+        rand::fill(&mut bytes[..]);
+        BASE64URL_NOPAD.encode(&bytes)
     }
 }
 
@@ -104,6 +165,34 @@ pub enum JoinResponse {
     },
 }
 
+/// Split a dotted version into numbers, for comparison. Unparseable parts count as zero.
+fn version_parts(version: &str) -> Vec<u32> {
+    version
+        .split('.')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect()
+}
+
+/// Whether `theirs` is newer than `ours`.
+///
+/// Only one direction matters. A joiner behind the inviter may be missing arguments the
+/// shared guide tells it to pass; a joiner ahead is fine, since the protocol has not
+/// changed under it.
+pub fn is_newer(theirs: &str, ours: &str) -> bool {
+    let (theirs, ours) = (version_parts(theirs), version_parts(ours));
+    let width = theirs.len().max(ours.len());
+    for index in 0..width {
+        let (t, o) = (
+            theirs.get(index).copied().unwrap_or(0),
+            ours.get(index).copied().unwrap_or(0),
+        );
+        if t != o {
+            return t > o;
+        }
+    }
+    false
+}
+
 /// Compare tokens without an early exit.
 ///
 /// A 128-bit token is not realistically guessable byte by byte over a network, but a
@@ -121,14 +210,14 @@ pub fn tokens_match(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::random_hex;
     use iroh::SecretKey;
 
     fn sample() -> InviteCode {
         InviteCode {
-            name: "claude".into(),
-            id: SecretKey::generate().public().to_string(),
-            token: random_hex(TOKEN_BYTES),
+            name: "kip".into(),
+            id: InviteCode::encode_id(&SecretKey::generate().public()),
+            token: InviteCode::new_token(),
+            version: Some(VERSION.to_string()),
         }
     }
 
@@ -173,14 +262,59 @@ mod tests {
     #[test]
     fn decode_rejects_a_wrong_part_count() {
         let code = sample();
-        assert!(InviteCode::decode(&format!("{}.extra", code.encode())).is_err());
+        assert!(InviteCode::decode(&format!("{}.a.b", code.encode())).is_err());
         assert!(InviteCode::decode("a2a1.name.id").is_err());
     }
 
     #[test]
+    fn a_code_carries_the_version_that_minted_it() {
+        let code = sample();
+        let decoded = InviteCode::decode(&code.encode()).unwrap();
+        assert_eq!(decoded.version.as_deref(), Some(VERSION));
+    }
+
+    #[test]
+    fn a_code_from_before_versions_were_carried_still_parses() {
+        // Four parts, no version. It should read as "unknown", not as broken.
+        let code = sample();
+        let old = format!("a2a1.{}.{}.{}", code.name, code.id, code.token);
+        let decoded = InviteCode::decode(&old).unwrap();
+        assert_eq!(decoded.version, None);
+    }
+
+    #[test]
+    fn decode_rejects_a_malformed_version() {
+        let code = sample();
+        let bad = format!("a2a1.{}.{}.{}.zz", code.name, code.id, code.token);
+        assert!(InviteCode::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn only_a_newer_peer_counts_as_newer() {
+        assert!(is_newer("0.3.0", "0.2.9"));
+        assert!(is_newer("0.2.10", "0.2.9"));
+        assert!(is_newer("1.0.0", "0.9.9"));
+        assert!(!is_newer("0.2.9", "0.2.9"));
+        assert!(!is_newer("0.2.8", "0.2.9"), "being ahead is not a problem");
+        assert!(!is_newer("0.2", "0.2.0"), "missing parts read as zero");
+        assert!(is_newer("0.2.1", "0.2"));
+    }
+
+    #[test]
+    fn the_code_is_short_enough_to_paste() {
+        // It is copied by hand between two chats, so every character costs something.
+        let encoded = sample().encode();
+        assert!(
+            encoded.len() < 90,
+            "invite code grew to {} characters: {encoded}",
+            encoded.len()
+        );
+    }
+
+    #[test]
     fn decode_rejects_a_bad_endpoint_id() {
-        let token = random_hex(TOKEN_BYTES);
-        assert!(InviteCode::decode(&format!("a2a1.claude.not-a-key.{token}")).is_err());
+        let token = InviteCode::new_token();
+        assert!(InviteCode::decode(&format!("a2a1.kip.tooshort.{token}")).is_err());
     }
 
     #[test]
@@ -191,29 +325,40 @@ mod tests {
     }
 
     #[test]
+    fn an_endpoint_id_survives_the_round_trip() {
+        let key = SecretKey::generate().public();
+        let code = InviteCode {
+            name: "kip".into(),
+            id: InviteCode::encode_id(&key),
+            token: InviteCode::new_token(),
+            version: None,
+        };
+        assert_eq!(code.endpoint_id().unwrap(), key);
+    }
+
+    #[test]
     fn decode_rejects_a_malformed_token() {
         let code = sample();
-        // Too short, and non-hex of the right length.
-        assert!(InviteCode::decode(&format!("a2a1.claude.{}.abcd", code.id)).is_err());
-        let wrong = "z".repeat(TOKEN_BYTES * 2);
-        assert!(InviteCode::decode(&format!("a2a1.claude.{}.{wrong}", code.id)).is_err());
+        // Too short, and not base64url at all.
+        assert!(InviteCode::decode(&format!("a2a1.kip.{}.abcd", code.id)).is_err());
+        assert!(InviteCode::decode(&format!("a2a1.kip.{}.****************", code.id)).is_err());
     }
 
     #[test]
     fn tokens_match_only_on_equality() {
-        let token = random_hex(TOKEN_BYTES);
+        let token = InviteCode::new_token();
         assert!(tokens_match(&token, &token.clone()));
-        assert!(!tokens_match(&token, &random_hex(TOKEN_BYTES)));
+        assert!(!tokens_match(&token, &InviteCode::new_token()));
         assert!(!tokens_match(&token, ""));
         assert!(!tokens_match("", ""), "an empty token never matches");
     }
 
     #[test]
     fn tokens_are_unpredictable() {
-        let a = random_hex(TOKEN_BYTES);
-        let b = random_hex(TOKEN_BYTES);
+        let a = InviteCode::new_token();
+        let b = InviteCode::new_token();
         assert_ne!(a, b);
-        assert_eq!(a.len(), TOKEN_BYTES * 2);
+        assert!(a.len() < TOKEN_BYTES * 2, "denser than hex: {a}");
     }
 
     #[test]
@@ -226,7 +371,7 @@ mod tests {
     fn join_messages_roundtrip() {
         let request = JoinRequest {
             v: 1,
-            token: random_hex(TOKEN_BYTES),
+            token: InviteCode::new_token(),
             name: "codex".into(),
         };
         let json = serde_json::to_string(&request).unwrap();

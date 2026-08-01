@@ -236,8 +236,9 @@ async fn joining_without_an_open_invite_is_refused() {
     // A well-formed code for a real endpoint that never opened an invite.
     let code = InviteCode {
         name: "claude".into(),
-        id: claude.id().to_string(),
-        token: "a".repeat(32),
+        id: InviteCode::encode_id(&claude.id()),
+        token: InviteCode::new_token(),
+        version: None,
     };
 
     let err = codex
