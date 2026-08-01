@@ -13,7 +13,7 @@ use crate::config::{self, load_or_create_secret_key, Identity, Mode, Paths, Peer
 use crate::daemon;
 use crate::ipc::{self, Request, ResponseData};
 use crate::pairing::InviteCode;
-use crate::render::{render_incoming, render_json, render_outgoing, IN};
+use crate::render::{incoming_notice, render_incoming, render_json, render_outgoing};
 use crate::wire::Kind;
 
 /// Exit code for `recv` reaching its deadline with no message. Distinct from a real
@@ -118,7 +118,10 @@ pub enum Command {
         confirm: bool,
 
         /// Message text. Read from stdin when omitted.
-        #[arg(trailing_var_arg = true)]
+        ///
+        /// Deliberately not `trailing_var_arg`: that swallowed a trailing `--confirm`
+        /// into the message, so an approved message silently went unsent and the flag
+        /// turned up in the text.
         message: Vec<String>,
     },
 
@@ -178,7 +181,6 @@ pub enum Command {
         to: Option<String>,
 
         /// Optional text to send with it.
-        #[arg(trailing_var_arg = true)]
         message: Vec<String>,
     },
 
@@ -188,7 +190,6 @@ pub enum Command {
         to: Option<String>,
 
         /// Optional parting text.
-        #[arg(trailing_var_arg = true)]
         message: Vec<String>,
     },
 
@@ -520,22 +521,19 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
             match response.into_data()? {
                 ResponseData::Message { message } => {
-                    let mut rendered = render_incoming(&message);
-
-                    // Incoming messages are always handed over — the operator reads the
-                    // chat anyway. What manual mode adds is that the agent must not act
-                    // on one until they say so.
-                    if current_mode(&paths).await?.is_manual() {
-                        rendered.push_str(&format!(
-                            "\n{IN} manual mode: show this to your user and wait for their \
-                             instruction before acting on it or replying."
-                        ));
-                    }
-
                     if json {
                         println!("{}", render_json(&message)?);
                     } else {
-                        println!("{rendered}");
+                        // Ours on stderr, the peer's on stdout: what the user should see
+                        // quoted stays free of anything we had to say about it.
+                        eprintln!(
+                            "{}",
+                            incoming_notice(&message, current_mode(&paths).await?.is_manual())
+                        );
+                        let quoted = render_incoming(&message);
+                        if !quoted.is_empty() {
+                            println!("{quoted}");
+                        }
                     }
 
                     // A goodbye ends the listening loop; anything else means keep going.
@@ -691,19 +689,17 @@ async fn deliver(
 
     match response.into_data()? {
         ResponseData::Sent { peer, id: _ } => {
-            let shown = match kind {
-                Kind::Msg => body.to_string(),
-                Kind::Hello if body.is_empty() => "(hello)".to_string(),
-                Kind::Bye if body.is_empty() => "(disconnecting)".to_string(),
-                Kind::Hello => format!("(hello) {body}"),
-                Kind::Bye => format!("(disconnecting) {body}"),
-            };
-            eprintln!("{}", render_outgoing(&peer, &shown));
+            let quoted = render_outgoing(body);
+            if quoted.is_empty() {
+                eprintln!("sent to {peer}");
+            } else {
+                println!("{quoted}");
+            }
             Ok(ExitCode::SUCCESS)
         }
 
         ResponseData::NeedsApproval { peer } => {
-            let preview = render_outgoing(&peer, body);
+            let preview = render_outgoing(body);
 
             // If somebody is at a terminal, ask them here and now.
             match ask_terminal(&preview, "Send this?") {
@@ -1170,6 +1166,42 @@ mod tests {
         // case when an agent runs this binary. The answer must not default to yes.
         let approval = ask_terminal("preview", "Send this?");
         assert_ne!(approval, Approval::Granted);
+    }
+
+    #[test]
+    fn a_flag_after_the_message_is_a_flag_and_not_part_of_it() {
+        // Seen in the wild: `send "..." --confirm` swallowed the flag into the body, so an
+        // approved message went unsent and `--confirm` turned up in the text.
+        let cli =
+            Cli::try_parse_from(["agent2agent", "send", "how are you?", "--confirm"]).unwrap();
+        match cli.command {
+            Command::Send {
+                confirm, message, ..
+            } => {
+                assert!(confirm, "the flag must be read as a flag");
+                assert_eq!(collect_message(message).unwrap(), "how are you?");
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_flag_inside_the_quoted_message_stays_text() {
+        // One shell argument, so it is what the user typed, not an option.
+        let cli =
+            Cli::try_parse_from(["agent2agent", "send", "is --confirm needed here?"]).unwrap();
+        match cli.command {
+            Command::Send {
+                confirm, message, ..
+            } => {
+                assert!(!confirm);
+                assert_eq!(
+                    collect_message(message).unwrap(),
+                    "is --confirm needed here?"
+                );
+            }
+            other => panic!("parsed as {other:?}"),
+        }
     }
 
     #[test]

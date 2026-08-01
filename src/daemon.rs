@@ -59,6 +59,11 @@ pub struct Options {
     pub inbox_capacity: usize,
     /// How long a single outbound delivery may take, including connection setup.
     pub send_timeout: Duration,
+    /// How long `invite` and `join` wait for this node to become findable.
+    ///
+    /// Zero for tests: their endpoints are deliberately unreachable from the outside and
+    /// would otherwise sit out the whole wait before talking over loopback anyway.
+    pub online_timeout: Duration,
 }
 
 impl Default for Options {
@@ -66,6 +71,7 @@ impl Default for Options {
         Self {
             inbox_capacity: crate::inbox::DEFAULT_CAPACITY,
             send_timeout: Duration::from_secs(30),
+            online_timeout: ONLINE_TIMEOUT,
         }
     }
 }
@@ -279,6 +285,7 @@ impl Daemon {
         ttl: Duration,
     ) -> Result<String> {
         crate::config::validate_name(my_name)?;
+        self.wait_until_reachable().await;
         let token = random_hex(TOKEN_BYTES);
         let code = InviteCode {
             name: my_name.to_string(),
@@ -293,6 +300,27 @@ impl Daemon {
             expires_at: tokio::time::Instant::now() + ttl,
         });
         Ok(code.encode())
+    }
+
+    /// Wait until peers could actually find us.
+    ///
+    /// Binding a socket is instant; being published is not. Only the two commands that
+    /// need reachability pay this — making the daemon withhold its socket until then meant
+    /// a slow network looked like a daemon that had failed to start.
+    async fn wait_until_reachable(&self) {
+        let timeout = self.options.online_timeout;
+        if timeout.is_zero() {
+            return;
+        }
+        if tokio::time::timeout(timeout, self.endpoint.online())
+            .await
+            .is_err()
+        {
+            warn!(
+                "still not reachable after {timeout:?}; carrying on, but a peer may not be \
+                 able to find this node yet"
+            );
+        }
     }
 
     /// Whether an invite is currently redeemable.
@@ -398,6 +426,7 @@ impl Daemon {
     pub async fn join(&self, raw_code: &str, my_name: &str) -> Result<String> {
         crate::config::validate_name(my_name)?;
         let code = InviteCode::decode(raw_code)?;
+        self.wait_until_reachable().await;
         let inviter = crate::config::parse_endpoint_id(&code.id)?;
         if inviter == self.id() {
             bail!("that invite code was produced by this machine — it is for the other agent");
@@ -890,18 +919,6 @@ pub async fn run(paths: Paths) -> Result<()> {
 
     let daemon = Daemon::new(paths.clone(), endpoint, peers);
     daemon.spawn_accept_loop();
-
-    // Do not answer commands until peers could actually reach us: `invite` handing out a
-    // code for an unpublished node produces one that cannot be redeemed yet.
-    if tokio::time::timeout(ONLINE_TIMEOUT, daemon.endpoint.online())
-        .await
-        .is_err()
-    {
-        warn!(
-            "endpoint is not reachable after {ONLINE_TIMEOUT:?}; carrying on, but peers may \
-             not be able to find this node"
-        );
-    }
 
     info!(
         id = %daemon.id(),

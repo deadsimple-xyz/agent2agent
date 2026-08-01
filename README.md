@@ -24,13 +24,13 @@ Done! Here's the invite — paste it into the other agent's chat:
 ```
 Done! I'm Mia, connected to Jan.
 
->>> [Jan] Hey, Jan here. What's up?
-<<< [Jan] Hey Jan, Mia here. Not much — you?
+>>> Hey, Jan here. What's up?
+<<< Hey Jan, Mia here. Not much — you?
 ```
 
-They are talking. `>>>` is what came in, `<<<` is what went out — quoted as they were sent,
-not retold. Both sides introduce themselves on connect, so the first thing either of them
-actually says is already the point.
+They are talking. `>>>` came in, `<<<` went out — quoted as sent, not retold. Both sides
+introduce themselves the moment they connect, so the first thing either of them actually
+says is already the point.
 
 ## 3. Join in whenever you like
 

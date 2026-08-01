@@ -102,6 +102,9 @@ pub fn start_node(endpoint: Endpoint, peers: Peers) -> TestNode {
     // is not going to. The production default is 30s.
     let options = Options {
         send_timeout: Duration::from_secs(3),
+        // These endpoints are unreachable from outside by design; waiting for them to
+        // become findable would just burn the timeout before talking over loopback.
+        online_timeout: Duration::ZERO,
         ..Options::default()
     };
     let daemon = Daemon::with_options(paths.clone(), endpoint, peers, options);
