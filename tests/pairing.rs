@@ -41,6 +41,15 @@ async fn one_code_pairs_both_directions() {
         "the joiner files the inviter under the code's name"
     );
 
+    // Joining introduces itself first; step past that to the real message.
+    let introduction = claude
+        .daemon
+        .inbox()
+        .pop_wait(None, PATIENCE)
+        .await
+        .unwrap();
+    assert_eq!(introduction.kind, agent2agent::wire::Kind::Hello);
+
     // Both sides now authorize each other, so messages flow without further setup.
     codex.daemon.send(Some("claude"), "joined").await.unwrap();
     let got = claude
@@ -336,4 +345,68 @@ async fn pairing_does_not_open_a_hole_for_ordinary_messages() {
         "an open invite must not authorize ordinary messages"
     );
     assert!(claude.daemon.inbox().is_empty());
+}
+
+#[tokio::test]
+async fn joining_introduces_you_to_the_inviter_by_name() {
+    // The inviter is already listening when the code is redeemed. Leaving it to stare at
+    // an empty channel until the other agent gets round to replying makes a completed
+    // handshake look like a failed one.
+    let (claude, codex) = inviter_and_joiner().await;
+
+    let code = claude
+        .daemon
+        .create_invite("Claude", None, Duration::from_secs(60))
+        .await
+        .unwrap();
+    codex.daemon.join(&code, "Codex").await.unwrap();
+
+    let got = claude
+        .daemon
+        .inbox()
+        .pop_wait(None, PATIENCE)
+        .await
+        .expect("the joiner should say hello without being asked");
+
+    assert_eq!(got.peer, "Codex");
+    assert_eq!(got.kind, agent2agent::wire::Kind::Hello);
+    assert!(
+        got.body.contains("Codex"),
+        "the introduction should name the arrival: {:?}",
+        got.body
+    );
+    assert!(
+        got.body.contains("Claude"),
+        "and address the inviter: {:?}",
+        got.body
+    );
+}
+
+#[tokio::test]
+async fn both_sides_end_up_knowing_each_other_by_name() {
+    let (claude, codex) = inviter_and_joiner().await;
+
+    let code = claude
+        .daemon
+        .create_invite(
+            "Claude",
+            Some("Hey, Claude here.".into()),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    codex.daemon.join(&code, "Codex").await.unwrap();
+
+    // The joiner learns the inviter's name from the code...
+    let greeting = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();
+    assert_eq!(greeting.peer, "Claude");
+
+    // ...and the inviter learns the joiner's from the authenticated connection.
+    let introduction = claude
+        .daemon
+        .inbox()
+        .pop_wait(None, PATIENCE)
+        .await
+        .unwrap();
+    assert_eq!(introduction.peer, "Codex");
 }

@@ -419,7 +419,20 @@ impl Daemon {
         };
 
         match self.perform_join(addr, &code.token, my_name).await {
-            Ok(_) => Ok(peer_name),
+            Ok(_) => {
+                // Answer straight away. The inviter is already listening, and leaving it
+                // to stare at an empty channel until this agent gets round to replying
+                // makes a completed handshake look like a failed one. It also puts a name
+                // to whoever just arrived.
+                let introduction = format!("Hey {peer_name}, {my_name} here.");
+                if let Err(e) = self
+                    .send_kind(Some(&peer_name), Kind::Hello, &introduction)
+                    .await
+                {
+                    warn!(peer = %peer_name, error = %e, "could not introduce myself");
+                }
+                Ok(peer_name)
+            }
             Err(e) => {
                 // Leave no half-authorized peer behind, unless it predates this attempt.
                 if !was_already_known {
