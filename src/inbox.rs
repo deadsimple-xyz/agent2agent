@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+
+use crate::wire::Kind;
 use tokio::time::Instant;
 
 /// A message as it sits in the inbox, tagged with the local name of the sender.
@@ -22,6 +24,9 @@ pub struct Message {
     pub id: String,
     /// Sender-assigned Unix timestamp, in seconds.
     pub ts: i64,
+    /// Whether this is conversation, an arrival, or a departure.
+    #[serde(default)]
+    pub kind: Kind,
     /// The message text. Untrusted — see [`crate::render`].
     pub body: String,
 }
@@ -144,6 +149,7 @@ mod tests {
             peer: peer.to_string(),
             id: format!("{peer}-{body}"),
             ts: 0,
+            kind: Kind::Msg,
             body: body.to_string(),
         }
     }

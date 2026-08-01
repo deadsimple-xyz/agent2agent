@@ -8,6 +8,7 @@ use agent2agent::config::Peers;
 use agent2agent::daemon::{bind_ipc, Daemon};
 use agent2agent::inbox::Message;
 use agent2agent::ipc::{self, Request, Response, ResponseData};
+use agent2agent::wire::Kind;
 use common::{linked_pair, offline_endpoint, peers_knowing, start_node, TestNode, PATIENCE};
 use iroh::SecretKey;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -58,6 +59,7 @@ async fn send_and_receive_across_the_socket() {
         Request::Send {
             peer: None,
             body: "over the socket".into(),
+            kind: Kind::Msg,
         },
     )
     .await
@@ -174,6 +176,7 @@ async fn sending_with_no_peers_configured_explains_what_to_do() {
         Request::Send {
             peer: None,
             body: "into the void".into(),
+            kind: Kind::Msg,
         },
     )
     .await;
@@ -211,6 +214,7 @@ async fn reload_over_the_socket_picks_up_a_new_peer() {
         Request::Send {
             peer: None,
             body: "after reload".into(),
+            kind: Kind::Msg,
         },
     )
     .await
@@ -393,6 +397,7 @@ async fn a_daemon_side_error_reaches_the_client_as_a_response() {
         Request::Send {
             peer: Some("ghost".into()),
             body: "hello".into(),
+            kind: Kind::Msg,
         },
     )
     .await;

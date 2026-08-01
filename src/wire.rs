@@ -21,6 +21,33 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// Largest frame we will write or accept, in bytes.
 pub const MAX_FRAME: usize = 1024 * 1024;
 
+/// What a message is for.
+///
+/// A typed field rather than a marker in the body: leaving-the-conversation has to be
+/// something a peer states, not something its prose can be mistaken for. It also means a
+/// receiving agent can branch on it without parsing text it is told never to trust.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Kind {
+    /// Ordinary conversation.
+    #[default]
+    Msg,
+    /// "I am here" — opens, or reopens, the session.
+    Hello,
+    /// "I am leaving" — the sender will not be reading replies.
+    Bye,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Msg => "msg",
+            Kind::Hello => "hello",
+            Kind::Bye => "bye",
+        }
+    }
+}
+
 /// A message sent from one agent to another.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WireMsg {
@@ -30,17 +57,26 @@ pub struct WireMsg {
     pub id: String,
     /// Unix timestamp in seconds, assigned by the sender. Advisory only.
     pub ts: i64,
-    /// The message text.
+    /// What this message is for. Absent on the wire means [`Kind::Msg`], so a peer
+    /// running an older build still parses.
+    #[serde(default)]
+    pub kind: Kind,
+    /// The message text. May be empty for a bare `hello` or `bye`.
     pub body: String,
 }
 
 impl WireMsg {
     /// Build a new outgoing message with a fresh id and the current timestamp.
     pub fn new(body: impl Into<String>) -> Self {
+        Self::of_kind(Kind::Msg, body)
+    }
+
+    pub fn of_kind(kind: Kind, body: impl Into<String>) -> Self {
         Self {
             v: PROTOCOL_VERSION,
             id: new_message_id(),
             ts: now_ts(),
+            kind,
             body: body.into(),
         }
     }

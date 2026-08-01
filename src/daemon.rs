@@ -3,7 +3,7 @@
 //! It exists so that hole punching happens once rather than on every `send`, and so a
 //! message that arrives while no CLI is attached still lands somewhere.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,7 +23,7 @@ use crate::pairing::{
     tokens_match, InviteCode, JoinRequest, JoinResponse, DEFAULT_TTL_SECS, PAIR_ALPN, TOKEN_BYTES,
 };
 use crate::util::random_hex;
-use crate::wire::{read_json, write_json, Ack, WireMsg, ALPN, PROTOCOL_VERSION};
+use crate::wire::{read_json, write_json, Ack, Kind, WireMsg, ALPN, PROTOCOL_VERSION};
 
 /// QUIC close code for a connection from an endpoint id we do not know.
 const CLOSE_UNAUTHORIZED: u32 = 1;
@@ -73,6 +73,12 @@ pub struct Daemon {
     options: Options,
     /// The outstanding invite, if `invite` has been run and not yet redeemed.
     invite: Mutex<Option<PendingInvite>>,
+    /// Peers that have said goodbye, or that we have said goodbye to.
+    ///
+    /// Held in memory rather than on disk: a daemon restart is not a departure, and after
+    /// one the honest answer is "nobody has told us they left". Any traffic from a peer
+    /// clears its entry — an agent that is talking is plainly still there.
+    departed: RwLock<HashSet<String>>,
     /// Live outbound connections, keyed by peer. Reused so that only the first message
     /// to a peer pays for hole punching.
     connections: Mutex<HashMap<EndpointId, Connection>>,
@@ -100,6 +106,7 @@ impl Daemon {
             peers: RwLock::new(peers),
             options,
             invite: Mutex::new(None),
+            departed: RwLock::new(HashSet::new()),
             connections: Mutex::new(HashMap::new()),
         })
     }
@@ -209,10 +216,23 @@ impl Daemon {
             bail!("peer sent protocol version {}", message.v);
         }
 
+        // Track presence before queueing. A peer that says anything at all is here; one
+        // that says goodbye is not, and `send` must stop pretending otherwise.
+        match message.kind {
+            Kind::Bye => {
+                self.departed.write().await.insert(peer_name.to_string());
+                info!(peer = %peer_name, "peer said goodbye");
+            }
+            Kind::Msg | Kind::Hello => {
+                self.departed.write().await.remove(peer_name);
+            }
+        }
+
         let evicted = self.inbox.push(Message {
             peer: peer_name.to_string(),
             id: message.id.clone(),
             ts: message.ts,
+            kind: message.kind,
             body: message.body,
         });
         if let Some(evicted) = evicted {
@@ -434,13 +454,45 @@ impl Daemon {
 
     /// Deliver `body` to a peer. Returns the resolved peer name and the message id.
     pub async fn send(&self, peer: Option<&str>, body: &str) -> Result<(String, String)> {
+        self.send_kind(peer, Kind::Msg, body).await
+    }
+
+    /// Deliver a message of a given kind.
+    ///
+    /// Ordinary messages to a peer that has said goodbye are refused: an agent should not
+    /// be left talking to someone who told it they had gone. `hello` is how you reopen.
+    pub async fn send_kind(
+        &self,
+        peer: Option<&str>,
+        kind: Kind,
+        body: &str,
+    ) -> Result<(String, String)> {
         let (name, addr) = {
             let peers = self.peers.read().await;
             let (name, peer) = peers.resolve(peer)?;
             (name, peer.endpoint_addr()?)
         };
 
-        let message = WireMsg::new(body);
+        if kind == Kind::Msg && self.departed.read().await.contains(&name) {
+            bail!(
+                "{name} has disconnected and is not reading replies; \
+                 reopen the conversation with `agent2agent hello --to {name}` if you think they are back"
+            );
+        }
+
+        // Saying hello reopens locally; saying goodbye closes locally. Either way the
+        // local view updates whether or not the peer is currently reachable.
+        match kind {
+            Kind::Hello => {
+                self.departed.write().await.remove(&name);
+            }
+            Kind::Bye => {
+                self.departed.write().await.insert(name.clone());
+            }
+            Kind::Msg => {}
+        }
+
+        let message = WireMsg::of_kind(kind, body);
         let timeout = self.options.send_timeout;
         let deliver = self.deliver(&addr, &message);
         tokio::time::timeout(timeout, deliver)
@@ -527,10 +579,12 @@ impl Daemon {
     /// Apply one CLI request.
     pub async fn handle(&self, request: Request) -> Response {
         match request {
-            Request::Send { peer, body } => match self.send(peer.as_deref(), &body).await {
-                Ok((peer, id)) => Response::ok(ResponseData::Sent { peer, id }),
-                Err(e) => Response::error(format!("{e:#}")),
-            },
+            Request::Send { peer, body, kind } => {
+                match self.send_kind(peer.as_deref(), kind, &body).await {
+                    Ok((peer, id)) => Response::ok(ResponseData::Sent { peer, id }),
+                    Err(e) => Response::error(format!("{e:#}")),
+                }
+            }
 
             Request::Recv { peer, wait_ms } => {
                 // Waiting on a peer that is not configured would block until the
@@ -580,6 +634,9 @@ impl Daemon {
 
             Request::Status => {
                 let invite_open = self.invite_is_open().await;
+                let mut departed: Vec<String> =
+                    self.departed.read().await.iter().cloned().collect();
+                departed.sort();
                 let peers = self.peers.read().await;
                 Response::ok(ResponseData::Status(StatusInfo {
                     id: self.id().to_string(),
@@ -591,6 +648,7 @@ impl Daemon {
                     default_peer: peers.default.clone(),
                     mode: peers.mode.to_string(),
                     invite_open,
+                    departed,
                     queued: self.inbox.counts(),
                     queued_total: self.inbox.len(),
                 }))
@@ -604,6 +662,11 @@ impl Daemon {
                 Err(e) => Response::error(format!("{e:#}")),
             },
         }
+    }
+
+    /// Whether a peer has told us it is gone.
+    pub async fn has_departed(&self, peer: &str) -> bool {
+        self.departed.read().await.contains(peer)
     }
 
     /// Report the mode, or change it and persist the change.

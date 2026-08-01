@@ -18,6 +18,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::inbox::Message;
+use crate::wire::Kind;
 
 /// A request from the CLI to the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,9 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         peer: Option<String>,
         body: String,
+        /// Conversation, an arrival, or a departure.
+        #[serde(default)]
+        kind: Kind,
     },
     /// Take one message from the inbox, waiting up to `wait_ms`.
     Recv {
@@ -130,6 +134,9 @@ pub struct StatusInfo {
     /// Whether an invite is currently redeemable.
     #[serde(default)]
     pub invite_open: bool,
+    /// Peers that have said goodbye and are not reading replies.
+    #[serde(default)]
+    pub departed: Vec<String>,
     /// Queued messages per peer.
     pub queued: BTreeMap<String, usize>,
     /// Total queued messages.
@@ -202,10 +209,12 @@ mod tests {
             Request::Send {
                 peer: Some("codex".into()),
                 body: "hello".into(),
+                kind: Kind::Msg,
             },
             Request::Send {
                 peer: None,
                 body: String::new(),
+                kind: Kind::Bye,
             },
             Request::Recv {
                 peer: None,
@@ -231,9 +240,10 @@ mod tests {
         let json = serde_json::to_string(&Request::Send {
             peer: None,
             body: "hi".into(),
+            kind: Kind::Msg,
         })
         .unwrap();
-        assert_eq!(json, r#"{"cmd":"send","body":"hi"}"#);
+        assert_eq!(json, r#"{"cmd":"send","body":"hi","kind":"msg"}"#);
     }
 
     #[test]
@@ -260,6 +270,7 @@ mod tests {
             peer: "codex".into(),
             id: "id1".into(),
             ts: 42,
+            kind: Kind::Msg,
             body: "body".into(),
         };
         let cases = vec![
@@ -276,6 +287,7 @@ mod tests {
                 default_peer: Some("codex".into()),
                 mode: "auto".into(),
                 invite_open: true,
+                departed: vec!["codex".to_string()],
                 queued: BTreeMap::from([("codex".to_string(), 2)]),
                 queued_total: 2,
             })),
@@ -303,6 +315,7 @@ mod tests {
                 peer: "codex".into(),
                 id: "id".into(),
                 ts: 0,
+                kind: Kind::Msg,
                 body: "first\nsecond".into(),
             },
         });

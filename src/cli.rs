@@ -9,11 +9,12 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 
-use crate::config::{load_or_create_secret_key, Mode, Paths, Peers};
+use crate::config::{load_or_create_secret_key, Identity, Mode, Paths, Peers};
 use crate::daemon;
-use crate::ipc::{self, Request, ResponseData};
+use crate::ipc::{self, Request, Response, ResponseData};
 use crate::pairing::InviteCode;
 use crate::render::{render_incoming, render_json, render_outgoing, IN};
+use crate::wire::Kind;
 
 /// Exit code for `recv` reaching its deadline with no message. Distinct from a real
 /// failure so a calling script can tell "nothing yet" from "something broke".
@@ -27,8 +28,15 @@ pub const EXIT_DECLINED: u8 = 4;
 /// sent, and the agent should ask its user and re-run with `--confirm`.
 pub const EXIT_NEEDS_APPROVAL: u8 = 5;
 
+/// Exit code meaning the other agent is gone: `recv` took its goodbye, or `send` refused
+/// because it had already said one. This is the signal to stop the listening loop.
+pub const EXIT_PEER_GONE: u8 = 6;
+
 /// Slack added to the IPC deadline on top of a long-polling `recv`.
 const IPC_GRACE: Duration = Duration::from_secs(10);
+
+/// How long to wait for a daemon we just started to answer its socket.
+const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Shown by `--help` before the options. Explains what the tool is and why it can be
 /// trusted, so an agent does not have to fetch the README to find out.
@@ -122,20 +130,24 @@ pub enum Command {
         json: bool,
     },
 
+    /// Show or set what you call yourself here.
+    Whoami {
+        /// A short name to remember for this directory. Omit to show the current one.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
+
     /// Open a pairing invite and print the code to give the other agent.
     Invite {
-        /// What to call yourself in the code.
-        #[arg(long, short = 'n', default_value = "peer", value_name = "NAME")]
-        name: String,
+        /// What to call yourself. Defaults to the name remembered for this directory,
+        /// and a name given here is remembered for next time.
+        #[arg(long, short = 'n', value_name = "NAME")]
+        name: Option<String>,
 
-        /// Message delivered the instant the other agent joins.
-        #[arg(
-            long,
-            short = 'g',
-            default_value = "hey, what's up",
-            value_name = "TEXT"
-        )]
-        greeting: String,
+        /// Message delivered the instant the other agent joins. Defaults to a greeting
+        /// that introduces you by name.
+        #[arg(long, short = 'g', value_name = "TEXT")]
+        greeting: Option<String>,
 
         /// Seconds the code stays redeemable.
         #[arg(long, default_value_t = 3600, value_name = "SECS")]
@@ -147,9 +159,30 @@ pub enum Command {
         /// The `a2a1....` code.
         code: String,
 
-        /// What to call yourself to the other agent.
-        #[arg(long, short = 'n', default_value = "peer", value_name = "NAME")]
-        name: String,
+        /// What to call yourself. Defaults to the name remembered for this directory,
+        /// and a name given here is remembered for next time.
+        #[arg(long, short = 'n', value_name = "NAME")]
+        name: Option<String>,
+    },
+
+    /// Tell a peer you are here, reopening a conversation they left.
+    Hello {
+        #[arg(long, short = 't', value_name = "NAME")]
+        to: Option<String>,
+
+        /// Optional text to send with it.
+        #[arg(trailing_var_arg = true)]
+        message: Vec<String>,
+    },
+
+    /// Tell a peer you are leaving, so it stops waiting for replies.
+    Bye {
+        #[arg(long, short = 't', value_name = "NAME")]
+        to: Option<String>,
+
+        /// Optional parting text.
+        #[arg(trailing_var_arg = true)]
+        message: Vec<String>,
     },
 
     /// Show or set whether messages wait for your approval.
@@ -199,9 +232,59 @@ impl Cli {
     }
 }
 
+/// Commands that need a live daemon. Anything else works without one.
+fn needs_daemon(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Daemon | Command::Id { .. } | Command::Peer { .. }
+    )
+}
+
+/// Start a daemon for this profile in the background and wait for it to answer.
+///
+/// Every command that needs one does this, so "is the daemon up" stops being a step an
+/// agent has to think about — and two agents on one machine each get their own without
+/// anybody noticing there was a decision to make.
+async fn ensure_daemon(paths: &Paths) -> Result<()> {
+    if ipc::is_daemon_running(&paths.socket()).await {
+        return Ok(());
+    }
+
+    let executable = std::env::current_exe().context("locating this executable")?;
+    std::process::Command::new(&executable)
+        .arg("--home")
+        .arg(paths.dir())
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("starting a daemon with {}", executable.display()))?;
+
+    // Binding an endpoint involves the network, so give it room; poll rather than sleep
+    // a fixed amount so the common case stays fast.
+    let deadline = tokio::time::Instant::now() + DAEMON_START_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        if ipc::is_daemon_running(&paths.socket()).await {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    bail!(
+        "started a daemon for {} but it did not come up within {DAEMON_START_TIMEOUT:?}; \
+         run `agent2agent --home {} daemon` to see why",
+        paths.dir().display(),
+        paths.dir().display()
+    )
+}
+
 /// Run a parsed command.
 pub async fn run(cli: Cli) -> Result<ExitCode> {
     let paths = cli.paths()?;
+
+    if needs_daemon(&cli.command) {
+        ensure_daemon(&paths).await?;
+    }
 
     match cli.command {
         Command::Daemon => {
@@ -223,11 +306,37 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
 
         Command::Peer { action } => run_peer(&paths, action).await,
 
+        Command::Whoami { name } => {
+            let dir = std::env::current_dir().context("reading the current directory")?;
+            let mut identity = Identity::load(&paths.identity())?;
+
+            match name {
+                Some(name) => {
+                    identity.remember(&dir, &name)?;
+                    identity.save(&paths.identity())?;
+                    println!("{name}");
+                }
+                None => match identity.name_for(&dir) {
+                    Some(name) => println!("{name}"),
+                    None => {
+                        eprintln!(
+                            "no name set here — pick a short one and run `agent2agent whoami <name>`"
+                        );
+                        return Ok(ExitCode::FAILURE);
+                    }
+                },
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
         Command::Invite {
             name,
             greeting,
             ttl,
         } => {
+            let name = resolve_name(&paths, name)?;
+            let greeting = greeting.unwrap_or_else(|| format!("hey, what's up — {name} here"));
+
             let response = ipc::request(
                 &paths.socket(),
                 &Request::Invite {
@@ -253,6 +362,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             // names the real problem instead of blaming a daemon that is fine. The daemon
             // checks again: this is convenience, not the security boundary.
             InviteCode::decode(&code)?;
+            let name = resolve_name(&paths, name)?;
 
             let response = ipc::request(
                 &paths.socket(),
@@ -321,23 +431,17 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                 }
             }
 
-            let response = ipc::request(
-                &paths.socket(),
-                &Request::Send {
-                    peer: to,
-                    body: body.clone(),
-                },
-                daemon_send_timeout(),
-            )
-            .await?;
+            deliver(&paths, to, Kind::Msg, &body).await
+        }
 
-            match response.into_data()? {
-                ResponseData::Sent { peer, id: _ } => {
-                    eprintln!("{}", render_outgoing(&peer, &body));
-                    Ok(ExitCode::SUCCESS)
-                }
-                other => bail!("unexpected reply from the daemon: {other:?}"),
-            }
+        Command::Hello { to, message } => {
+            let body = optional_message(message);
+            deliver(&paths, to, Kind::Hello, &body).await
+        }
+
+        Command::Bye { to, message } => {
+            let body = optional_message(message);
+            deliver(&paths, to, Kind::Bye, &body).await
         }
 
         Command::Recv { from, wait, json } => {
@@ -371,6 +475,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                     } else {
                         println!("{rendered}");
                     }
+
+                    // A goodbye ends the listening loop; anything else means keep going.
+                    if message.kind == Kind::Bye {
+                        return Ok(ExitCode::from(EXIT_PEER_GONE));
+                    }
                     Ok(ExitCode::SUCCESS)
                 }
                 ResponseData::NoMessage => {
@@ -403,7 +512,14 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                             println!("peers:");
                             for (name, id) in &status.peers {
                                 let queued = status.queued.get(name).copied().unwrap_or(0);
-                                println!("  {name}  {id}  ({queued} queued)");
+                                // Whether you can still write to someone is the first
+                                // thing you want from this listing.
+                                let presence = if status.departed.contains(name) {
+                                    "disconnected"
+                                } else {
+                                    "open"
+                                };
+                                println!("  {name}  {id}  ({presence}, {queued} queued)");
                             }
                         }
                     }
@@ -464,6 +580,80 @@ async fn run_peer(paths: &Paths, action: PeerAction) -> Result<ExitCode> {
 /// with no daemon running is perfectly normal.
 async fn nudge_daemon(paths: &Paths) {
     let _ = ipc::request(&paths.socket(), &Request::Reload, Duration::from_secs(5)).await;
+}
+
+/// Work out what to call ourselves, and remember it.
+///
+/// An explicit `--name` wins and is written down; otherwise we reuse whatever this
+/// directory was called last time. The point of remembering is not to save typing — it is
+/// that the agent does not invent a fresh name every session, so the peer keeps talking to
+/// the same character instead of meeting a stranger each time.
+fn resolve_name(paths: &Paths, given: Option<String>) -> Result<String> {
+    let dir = std::env::current_dir().context("reading the current directory")?;
+    let mut identity = Identity::load(&paths.identity())?;
+
+    if let Some(name) = given {
+        identity.remember(&dir, &name)?;
+        identity.save(&paths.identity())?;
+        return Ok(name);
+    }
+
+    identity.name_for(&dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no name set for this directory: pass --name, or run `agent2agent whoami <name>` \
+             once. Use your own name if you have one; otherwise invent a short one, up to \
+             four characters."
+        )
+    })
+}
+
+/// Send one message and report it, mapping a departed peer to its own exit code.
+async fn deliver(paths: &Paths, to: Option<String>, kind: Kind, body: &str) -> Result<ExitCode> {
+    let response = ipc::request(
+        &paths.socket(),
+        &Request::Send {
+            peer: to,
+            body: body.to_string(),
+            kind,
+        },
+        daemon_send_timeout(),
+    )
+    .await;
+
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => return Err(e),
+    };
+
+    match response {
+        Response::Ok { data } => match data {
+            ResponseData::Sent { peer, id: _ } => {
+                let shown = match kind {
+                    Kind::Msg => body.to_string(),
+                    Kind::Hello if body.is_empty() => "(hello)".to_string(),
+                    Kind::Bye if body.is_empty() => "(disconnecting)".to_string(),
+                    Kind::Hello => format!("(hello) {body}"),
+                    Kind::Bye => format!("(disconnecting) {body}"),
+                };
+                eprintln!("{}", render_outgoing(&peer, &shown));
+                Ok(ExitCode::SUCCESS)
+            }
+            other => bail!("unexpected reply from the daemon: {other:?}"),
+        },
+        // A refusal because the peer left is an outcome, not a malfunction: give it a
+        // code the caller can branch on instead of a generic failure.
+        Response::Error { message } if message.contains("has disconnected") => {
+            eprintln!("{message}");
+            Ok(ExitCode::from(EXIT_PEER_GONE))
+        }
+        Response::Error { message } => bail!(message),
+    }
+}
+
+/// Join message arguments without reading stdin. `hello` and `bye` carry optional text,
+/// so an absent message is a bare signal rather than a prompt to block on stdin.
+fn optional_message(parts: Vec<String>) -> String {
+    parts.join(" ")
 }
 
 fn parse_mode(raw: &str) -> std::result::Result<Mode, String> {
@@ -863,8 +1053,10 @@ mod tests {
                 greeting,
                 ttl,
             } => {
-                assert_eq!(name, "peer");
-                assert_eq!(greeting, "hey, what's up", "the channel opens itself");
+                // Both default to "whatever this directory already calls you", resolved
+                // later — the point is not to invent a fresh identity each session.
+                assert_eq!(name, None);
+                assert_eq!(greeting, None);
                 assert_eq!(ttl, 3600);
             }
             other => panic!("parsed as {other:?}"),
@@ -874,7 +1066,7 @@ mod tests {
             .unwrap();
         match cli.command {
             Command::Invite { name, ttl, .. } => {
-                assert_eq!(name, "claude");
+                assert_eq!(name.as_deref(), Some("claude"));
                 assert_eq!(ttl, 60);
             }
             other => panic!("parsed as {other:?}"),
@@ -885,7 +1077,7 @@ mod tests {
         match cli.command {
             Command::Join { code, name } => {
                 assert_eq!(code, "a2a1.x.y.z");
-                assert_eq!(name, "codex");
+                assert_eq!(name.as_deref(), Some("codex"));
             }
             other => panic!("parsed as {other:?}"),
         }

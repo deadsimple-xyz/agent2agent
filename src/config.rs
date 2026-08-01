@@ -58,6 +58,10 @@ impl Paths {
         self.dir.join("daemon.sock")
     }
 
+    pub fn identity(&self) -> PathBuf {
+        self.dir.join("identity.toml")
+    }
+
     /// Create the state directory if needed, owner-accessible only.
     pub fn ensure_dir(&self) -> Result<()> {
         std::fs::create_dir_all(&self.dir)
@@ -163,6 +167,63 @@ impl std::str::FromStr for Mode {
             "manual" => Ok(Mode::Manual),
             other => bail!("unknown mode {other:?}, expected 'auto' or 'manual'"),
         }
+    }
+}
+
+/// What this agent calls itself, remembered per working directory.
+///
+/// An agent has no durable sense of its own name, so without this it would pick a new one
+/// every session and the other side would watch a stranger arrive each time. Keyed by
+/// directory because that is what a session is anchored to: the same project gets the
+/// same name back.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Identity {
+    /// Used when the current directory has no name of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<String>,
+    /// Absolute directory path to chosen name.
+    #[serde(default)]
+    pub dirs: BTreeMap<String, String>,
+}
+
+impl Identity {
+    pub fn load(path: &Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let text = toml::to_string_pretty(self).context("serializing identity")?;
+        std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// The name to use in `dir`, falling back to the default.
+    pub fn name_for(&self, dir: &Path) -> Option<String> {
+        self.dirs
+            .get(&dir.to_string_lossy().to_string())
+            .cloned()
+            .or_else(|| self.default.clone())
+    }
+
+    /// Remember `name` for `dir`, and as the fallback if there is none yet.
+    pub fn remember(&mut self, dir: &Path, name: &str) -> Result<()> {
+        validate_name(name)?;
+        self.dirs
+            .insert(dir.to_string_lossy().to_string(), name.to_string());
+        if self.default.is_none() {
+            self.default = Some(name.to_string());
+        }
+        Ok(())
     }
 }
 
@@ -526,6 +587,83 @@ mod tests {
         peers.add("codex", &new_id).unwrap();
         assert_eq!(peers.peers["codex"].id, new_id);
         assert_eq!(peers.peers.len(), 1);
+    }
+
+    #[test]
+    fn identity_remembers_a_name_per_directory() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("identity.toml");
+
+        let mut identity = Identity::default();
+        assert_eq!(identity.name_for(Path::new("/work/a")), None);
+
+        identity.remember(Path::new("/work/a"), "clod").unwrap();
+        identity.remember(Path::new("/work/b"), "prof").unwrap();
+        identity.save(&path).unwrap();
+
+        let loaded = Identity::load(&path).unwrap();
+        assert_eq!(
+            loaded.name_for(Path::new("/work/a")).as_deref(),
+            Some("clod")
+        );
+        assert_eq!(
+            loaded.name_for(Path::new("/work/b")).as_deref(),
+            Some("prof")
+        );
+    }
+
+    #[test]
+    fn identity_falls_back_to_the_first_name_taken() {
+        // A directory never seen before still gets a name, so the agent is recognisable
+        // rather than anonymous.
+        let mut identity = Identity::default();
+        identity.remember(Path::new("/work/a"), "clod").unwrap();
+
+        assert_eq!(
+            identity.name_for(Path::new("/somewhere/else")).as_deref(),
+            Some("clod")
+        );
+        assert_eq!(identity.default.as_deref(), Some("clod"));
+    }
+
+    #[test]
+    fn identity_keeps_the_same_name_on_repeat_visits() {
+        // The whole point: the agent must not invent a new name next session.
+        let mut identity = Identity::default();
+        identity.remember(Path::new("/work/a"), "clod").unwrap();
+        let first = identity.name_for(Path::new("/work/a"));
+        let second = identity.name_for(Path::new("/work/a"));
+        assert_eq!(first, second);
+        assert_eq!(first.as_deref(), Some("clod"));
+    }
+
+    #[test]
+    fn identity_can_be_renamed_for_a_directory() {
+        let mut identity = Identity::default();
+        identity.remember(Path::new("/work/a"), "clod").unwrap();
+        identity.remember(Path::new("/work/a"), "mia").unwrap();
+        assert_eq!(
+            identity.name_for(Path::new("/work/a")).as_deref(),
+            Some("mia")
+        );
+        assert_eq!(identity.dirs.len(), 1);
+    }
+
+    #[test]
+    fn identity_rejects_an_unusable_name() {
+        let mut identity = Identity::default();
+        assert!(identity
+            .remember(Path::new("/work/a"), "has space")
+            .is_err());
+        assert!(identity.remember(Path::new("/work/a"), "").is_err());
+        assert!(identity.dirs.is_empty());
+    }
+
+    #[test]
+    fn a_missing_identity_file_is_empty_not_an_error() {
+        let dir = TempDir::new().unwrap();
+        let loaded = Identity::load(&dir.path().join("nope.toml")).unwrap();
+        assert_eq!(loaded, Identity::default());
     }
 
     #[test]
