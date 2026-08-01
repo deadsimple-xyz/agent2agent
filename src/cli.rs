@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use crate::config::{load_or_create_secret_key, Mode, Paths, Peers};
 use crate::daemon;
 use crate::ipc::{self, Request, ResponseData};
+use crate::pairing::InviteCode;
 use crate::render::{render_incoming, render_json, render_outgoing, IN};
 
 /// Exit code for `recv` reaching its deadline with no message. Distinct from a real
@@ -220,6 +221,11 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
         }
 
         Command::Join { code, name } => {
+            // Reject a mistyped code here rather than after a round trip, so the failure
+            // names the real problem instead of blaming a daemon that is fine. The daemon
+            // checks again: this is convenience, not the security boundary.
+            InviteCode::decode(&code)?;
+
             let response = ipc::request(
                 &paths.socket(),
                 &Request::Join { code, name },
