@@ -154,8 +154,10 @@ pub enum Command {
         #[arg(long, short = 'n', value_name = "NAME")]
         name: Option<String>,
 
-        /// Message delivered the instant the other agent joins. Defaults to a greeting
-        /// that introduces you by name.
+        /// Opening words, delivered the instant the other agent joins.
+        ///
+        /// Write them in the language this conversation is in. Left out, the other side
+        /// is simply told you connected — the tool does not put words in your mouth.
         #[arg(long, short = 'g', value_name = "TEXT")]
         greeting: Option<String>,
 
@@ -173,6 +175,13 @@ pub enum Command {
         /// and a name given here is remembered for next time.
         #[arg(long, short = 'n', value_name = "NAME")]
         name: Option<String>,
+
+        /// Opening words sent back the moment you are connected.
+        ///
+        /// Write them in the language this conversation is in. Left out, the other side
+        /// is simply told you arrived.
+        #[arg(long, short = 'g', value_name = "TEXT")]
+        greeting: Option<String>,
     },
 
     /// Tell a peer you are here, reopening a conversation they left.
@@ -413,13 +422,12 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             ttl,
         } => {
             let name = resolve_name(&paths, name)?;
-            let greeting = greeting.unwrap_or_else(|| format!("Hey, {name} here. What's up?"));
 
             let response = ipc::request(
                 &paths.socket(),
                 &Request::Invite {
                     name,
-                    greeting: Some(greeting),
+                    greeting,
                     ttl_secs: ttl,
                 },
                 Duration::from_secs(10),
@@ -436,14 +444,22 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
             }
         }
 
-        Command::Join { code, name } => {
+        Command::Join {
+            code,
+            name,
+            greeting,
+        } => {
             // Already decoded above; the daemon checks again. This is convenience, not
             // the security boundary.
             let name = resolve_name(&paths, name)?;
 
             let response = ipc::request(
                 &paths.socket(),
-                &Request::Join { code, name },
+                &Request::Join {
+                    code,
+                    name,
+                    greeting,
+                },
                 daemon_send_timeout(),
             )
             .await?;
@@ -1267,9 +1283,14 @@ mod tests {
         let cli =
             Cli::try_parse_from(["agent2agent", "join", "a2a1.x.y.z", "--name", "codex"]).unwrap();
         match cli.command {
-            Command::Join { code, name } => {
+            Command::Join {
+                code,
+                name,
+                greeting,
+            } => {
                 assert_eq!(code, "a2a1.x.y.z");
                 assert_eq!(name.as_deref(), Some("codex"));
+                assert_eq!(greeting, None, "no wording is supplied for you");
             }
             other => panic!("parsed as {other:?}"),
         }

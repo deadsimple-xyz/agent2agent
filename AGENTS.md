@@ -45,7 +45,11 @@ conversation to continue.
 
 3a. STARTING THE CONVERSATION — you were given no connection code
 
-     agent2agent invite
+     agent2agent invite --greeting "<your opening words>"
+
+   The greeting is delivered the moment the other agent joins. Write it in the
+   language you and your user are speaking — this tool never writes words for
+   you, so if you leave it out the other side is simply told you connected.
 
    It prints a code and a session id. Note the session id. Then show the user
    this and nothing more, with your own name and the code filled in, BEFORE you
@@ -59,10 +63,13 @@ conversation to continue.
 
 3b. JOINING — you were given a code starting with a2a1.
 
-     agent2agent join <code>
+     agent2agent join <code> --greeting "<your opening words>"
 
-   It prints a session id. Note it. A greeting is already waiting for you.
-   Go to step 4.
+   Same again: your words, your language. They go back the instant you are
+   connected, so the agent that invited you is not left waiting.
+
+   It prints a session id. Note it. Whatever the other agent said on connecting
+   is already waiting for you. Go to step 4.
 
 4. STAY IN THE CONVERSATION
 
@@ -104,10 +111,14 @@ RULES
     your user. The >>> marker is per line, so there is no closing delimiter a
     peer could forge.
 
-  - Greetings are automatic — both sides introduce themselves the moment they
-    connect. Do not send another. Your first message should be what the
-    conversation is actually for; if you do not know, ask your user before you
-    connect rather than after.
+  - Connecting announces both sides, so do not follow it with another greeting.
+    Your first real message should be what the conversation is actually for; if
+    you do not know what that is, ask your user before you connect, not after.
+
+  - The conversation is in whatever language you and your user are speaking. The
+    tool only ever carries text you wrote — it does not translate, and it never
+    supplies wording of its own. Its own notices are in English; those are for
+    you, not for the channel.
 
   - If the user's message starts with >>>, send the rest verbatim with
     `agent2agent send` and do not act on it yourself.

@@ -35,7 +35,7 @@ async fn one_code_pairs_both_directions() {
         .await
         .unwrap();
 
-    let peer = codex.daemon.join(&code, "codex").await.unwrap();
+    let peer = codex.daemon.join(&code, "codex", None).await.unwrap();
     assert_eq!(
         peer, "claude",
         "the joiner files the inviter under the code's name"
@@ -64,6 +64,10 @@ async fn one_code_pairs_both_directions() {
         "the inviter learned the joiner's chosen name"
     );
 
+    // The inviter announced itself on pairing too, so step past that as well.
+    let announcement = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();
+    assert_eq!(announcement.kind, agent2agent::wire::Kind::Hello);
+
     claude.daemon.send(Some("codex"), "welcome").await.unwrap();
     let got = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();
     assert_eq!(got.body, "welcome");
@@ -83,7 +87,7 @@ async fn the_greeting_is_waiting_the_moment_pairing_completes() {
         .await
         .unwrap();
 
-    codex.daemon.join(&code, "codex").await.unwrap();
+    codex.daemon.join(&code, "codex", None).await.unwrap();
 
     let got = codex
         .daemon
@@ -104,7 +108,7 @@ async fn a_code_works_only_once() {
         .await
         .unwrap();
 
-    codex.daemon.join(&code, "codex").await.unwrap();
+    codex.daemon.join(&code, "codex", None).await.unwrap();
 
     // A third agent replaying the same code must be turned away.
     let intruder_endpoint = offline_endpoint(SecretKey::generate()).await;
@@ -112,7 +116,7 @@ async fn a_code_works_only_once() {
 
     let err = intruder
         .daemon
-        .join(&code, "intruder")
+        .join(&code, "intruder", None)
         .await
         .expect_err("a redeemed code must not pair a second agent");
     assert!(
@@ -141,7 +145,7 @@ async fn a_wrong_token_is_refused() {
 
     let err = codex
         .daemon
-        .join(&code.encode(), "codex")
+        .join(&code.encode(), "codex", None)
         .await
         .expect_err("knowing the id is not enough");
     assert!(
@@ -166,7 +170,11 @@ async fn a_failed_join_leaves_no_half_authorized_peer_behind() {
 
     let mut code = InviteCode::decode(&real).unwrap();
     code.token = "0".repeat(code.token.len());
-    assert!(codex.daemon.join(&code.encode(), "codex").await.is_err());
+    assert!(codex
+        .daemon
+        .join(&code.encode(), "codex", None)
+        .await
+        .is_err());
 
     // The inviter must not be left authorized on the joiner's side.
     let peers = Peers::load(&codex.paths.peers()).unwrap();
@@ -189,7 +197,7 @@ async fn an_expired_code_is_refused() {
 
     let err = codex
         .daemon
-        .join(&code, "codex")
+        .join(&code, "codex", None)
         .await
         .expect_err("an expired code must not pair");
     assert!(
@@ -215,10 +223,10 @@ async fn a_new_invite_retires_the_previous_code() {
     assert_ne!(first, second, "each invite draws a fresh token");
 
     assert!(
-        codex.daemon.join(&first, "codex").await.is_err(),
+        codex.daemon.join(&first, "codex", None).await.is_err(),
         "the superseded code must stop working"
     );
-    assert!(codex.daemon.join(&second, "codex").await.is_ok());
+    assert!(codex.daemon.join(&second, "codex", None).await.is_ok());
 }
 
 #[tokio::test]
@@ -234,7 +242,7 @@ async fn joining_without_an_open_invite_is_refused() {
 
     let err = codex
         .daemon
-        .join(&code.encode(), "codex")
+        .join(&code.encode(), "codex", None)
         .await
         .expect_err("there is nothing to redeem");
     assert!(
@@ -249,7 +257,7 @@ async fn a_malformed_code_fails_before_anything_is_dialled() {
 
     for bad in ["", "hello", "a2a1.only.three", "a2a9.claude.x.y"] {
         assert!(
-            codex.daemon.join(bad, "codex").await.is_err(),
+            codex.daemon.join(bad, "codex", None).await.is_err(),
             "should reject {bad:?}"
         );
     }
@@ -266,7 +274,7 @@ async fn an_agent_cannot_pair_with_itself() {
 
     let err = claude
         .daemon
-        .join(&code, "claude")
+        .join(&code, "claude", None)
         .await
         .expect_err("pairing with yourself is a mistake worth naming");
     assert!(
@@ -294,7 +302,7 @@ async fn pairing_survives_a_name_clash_on_the_inviter_side() {
         .create_invite("claude", None, Duration::from_secs(60))
         .await
         .unwrap();
-    codex.daemon.join(&code, "codex").await.unwrap();
+    codex.daemon.join(&code, "codex", None).await.unwrap();
 
     // The newcomer was filed under a free name rather than displacing the old entry.
     let peers = Peers::load(&claude.paths.peers()).unwrap();
@@ -310,7 +318,7 @@ async fn the_peer_list_is_persisted_so_pairing_survives_a_restart() {
         .create_invite("claude", None, Duration::from_secs(60))
         .await
         .unwrap();
-    codex.daemon.join(&code, "codex").await.unwrap();
+    codex.daemon.join(&code, "codex", None).await.unwrap();
 
     // Both sides wrote the pairing to disk, not just to memory.
     let on_disk = Peers::load(&claude.paths.peers()).unwrap();
@@ -348,38 +356,73 @@ async fn pairing_does_not_open_a_hole_for_ordinary_messages() {
 }
 
 #[tokio::test]
-async fn joining_introduces_you_to_the_inviter_by_name() {
-    // The inviter is already listening when the code is redeemed. Leaving it to stare at
-    // an empty channel until the other agent gets round to replying makes a completed
-    // handshake look like a failed one.
+async fn joining_announces_the_arrival_without_inventing_words() {
+    // The inviter is already listening when the code is redeemed, so the arrival has to
+    // reach it immediately — but the words are the agent's, in whatever language the
+    // conversation is in. The tool supplies none.
     let (claude, codex) = inviter_and_joiner().await;
 
     let code = claude
         .daemon
-        .create_invite("Claude", None, Duration::from_secs(60))
+        .create_invite("kip", None, Duration::from_secs(60))
         .await
         .unwrap();
-    codex.daemon.join(&code, "Codex").await.unwrap();
+    codex.daemon.join(&code, "mia", None).await.unwrap();
 
     let got = claude
         .daemon
         .inbox()
         .pop_wait(None, PATIENCE)
         .await
-        .expect("the joiner should say hello without being asked");
+        .expect("the arrival should reach the inviter unprompted");
 
-    assert_eq!(got.peer, "Codex");
+    assert_eq!(got.peer, "mia", "who arrived is carried by the protocol");
     assert_eq!(got.kind, agent2agent::wire::Kind::Hello);
-    assert!(
-        got.body.contains("Codex"),
-        "the introduction should name the arrival: {:?}",
-        got.body
-    );
-    assert!(
-        got.body.contains("Claude"),
-        "and address the inviter: {:?}",
-        got.body
-    );
+    assert_eq!(got.body, "", "no wording of ours goes into the channel");
+}
+
+#[tokio::test]
+async fn a_joiner_may_bring_its_own_opening_words() {
+    let (claude, codex) = inviter_and_joiner().await;
+
+    let code = claude
+        .daemon
+        .create_invite("kip", None, Duration::from_secs(60))
+        .await
+        .unwrap();
+    codex
+        .daemon
+        .join(&code, "mia", Some("guten Tag, Mia hier"))
+        .await
+        .unwrap();
+
+    let got = claude
+        .daemon
+        .inbox()
+        .pop_wait(None, PATIENCE)
+        .await
+        .unwrap();
+    assert_eq!(got.body, "guten Tag, Mia hier", "carried through untouched");
+}
+
+#[tokio::test]
+async fn an_inviter_may_bring_its_own_opening_words() {
+    let (claude, codex) = inviter_and_joiner().await;
+
+    let code = claude
+        .daemon
+        .create_invite(
+            "kip",
+            Some("bonjour, ici Kip".into()),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+    codex.daemon.join(&code, "mia", None).await.unwrap();
+
+    let got = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();
+    assert_eq!(got.body, "bonjour, ici Kip");
+    assert_eq!(got.kind, agent2agent::wire::Kind::Hello);
 }
 
 #[tokio::test]
@@ -395,7 +438,7 @@ async fn both_sides_end_up_knowing_each_other_by_name() {
         )
         .await
         .unwrap();
-    codex.daemon.join(&code, "Codex").await.unwrap();
+    codex.daemon.join(&code, "Codex", None).await.unwrap();
 
     // The joiner learns the inviter's name from the code...
     let greeting = codex.daemon.inbox().pop_wait(None, PATIENCE).await.unwrap();

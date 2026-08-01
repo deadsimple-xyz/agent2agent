@@ -378,10 +378,15 @@ impl Daemon {
             // Open the conversation so the joiner finds something already waiting
             // instead of an empty channel. The joiner authorized us before dialling,
             // so this is not a race.
-            if let Some(greeting) = greeting {
-                if let Err(e) = self.send(Some(&peer_name), &greeting).await {
-                    warn!(peer = %peer_name, error = %e, "could not deliver the opening message");
-                }
+            // The body is whatever the agent gave us and nothing else: the words in this
+            // conversation belong to the agents, in whatever language they are speaking,
+            // and are not ours to author.
+            let opening = greeting.unwrap_or_default();
+            if let Err(e) = self
+                .send_kind(Some(&peer_name), Kind::Hello, &opening)
+                .await
+            {
+                warn!(peer = %peer_name, error = %e, "could not announce myself");
             }
         }
         Ok(())
@@ -423,7 +428,12 @@ impl Daemon {
     }
 
     /// Redeem someone else's invite code. Returns the name we filed them under.
-    pub async fn join(&self, raw_code: &str, my_name: &str) -> Result<String> {
+    pub async fn join(
+        &self,
+        raw_code: &str,
+        my_name: &str,
+        introduction: Option<&str>,
+    ) -> Result<String> {
         crate::config::validate_name(my_name)?;
         let code = InviteCode::decode(raw_code)?;
         self.wait_until_reachable().await;
@@ -449,16 +459,19 @@ impl Daemon {
 
         match self.perform_join(addr, &code.token, my_name).await {
             Ok(_) => {
-                // Answer straight away. The inviter is already listening, and leaving it
+                // Answer straight away: the inviter is already listening, and leaving it
                 // to stare at an empty channel until this agent gets round to replying
-                // makes a completed handshake look like a failed one. It also puts a name
-                // to whoever just arrived.
-                let introduction = format!("Hey {peer_name}, {my_name} here.");
+                // makes a completed handshake look like a failed one. The arrival itself
+                // is the signal; any words are the agent's own.
                 if let Err(e) = self
-                    .send_kind(Some(&peer_name), Kind::Hello, &introduction)
+                    .send_kind(
+                        Some(&peer_name),
+                        Kind::Hello,
+                        introduction.unwrap_or_default(),
+                    )
                     .await
                 {
-                    warn!(peer = %peer_name, error = %e, "could not introduce myself");
+                    warn!(peer = %peer_name, error = %e, "could not announce myself");
                 }
                 Ok(peer_name)
             }
@@ -713,7 +726,11 @@ impl Daemon {
                 }
             }
 
-            Request::Join { code, name } => match self.join(&code, &name).await {
+            Request::Join {
+                code,
+                name,
+                greeting,
+            } => match self.join(&code, &name, greeting.as_deref()).await {
                 Ok(peer) => Response::ok(ResponseData::Joined { peer }),
                 Err(e) => Response::error(format!("{e:#}")),
             },

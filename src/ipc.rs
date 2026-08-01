@@ -62,6 +62,9 @@ pub enum Request {
         code: String,
         /// What we call ourselves to the inviter.
         name: String,
+        /// Optional opening words, in whatever language the conversation is in.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        greeting: Option<String>,
     },
     /// Report identity, peers and queue depth.
     Status,
