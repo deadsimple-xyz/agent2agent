@@ -156,10 +156,11 @@ pub enum Command {
 
         /// Opening words, delivered the instant the other agent joins.
         ///
-        /// Write them in the language this conversation is in. Left out, the other side
-        /// is simply told you connected — the tool does not put words in your mouth.
-        #[arg(long, short = 'g', value_name = "TEXT")]
-        greeting: Option<String>,
+        /// Required: someone has to say the first thing, and it is not going to be this
+        /// tool. Write it in the language the conversation is in, and make it about
+        /// whatever you are connecting for.
+        #[arg(long, short = 'g', value_name = "TEXT", required = true)]
+        greeting: String,
 
         /// Seconds the code stays redeemable.
         #[arg(long, default_value_t = 3600, value_name = "SECS")]
@@ -178,10 +179,9 @@ pub enum Command {
 
         /// Opening words sent back the moment you are connected.
         ///
-        /// Write them in the language this conversation is in. Left out, the other side
-        /// is simply told you arrived.
-        #[arg(long, short = 'g', value_name = "TEXT")]
-        greeting: Option<String>,
+        /// Required, for the same reason as on `invite`: answer, do not just arrive.
+        #[arg(long, short = 'g', value_name = "TEXT", required = true)]
+        greeting: String,
     },
 
     /// Tell a peer you are here, reopening a conversation they left.
@@ -427,7 +427,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                 &paths.socket(),
                 &Request::Invite {
                     name,
-                    greeting,
+                    greeting: Some(greeting),
                     ttl_secs: ttl,
                 },
                 Duration::from_secs(10),
@@ -458,7 +458,7 @@ pub async fn run(cli: Cli) -> Result<ExitCode> {
                 &Request::Join {
                     code,
                     name,
-                    greeting,
+                    greeting: Some(greeting),
                 },
                 daemon_send_timeout(),
             )
@@ -1253,25 +1253,52 @@ mod tests {
     }
 
     #[test]
+    fn opening_words_are_not_optional() {
+        // Someone has to say the first thing, and it is not this tool. Leaving it to a
+        // rule in the guide meant an agent could connect and say nothing at all.
+        assert!(Cli::try_parse_from(["agent2agent", "invite"]).is_err());
+        assert!(Cli::try_parse_from(["agent2agent", "join", "a2a1.x.y.z"]).is_err());
+
+        let error = Cli::try_parse_from(["agent2agent", "invite"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--greeting"),
+            "the error should name what is missing: {error}"
+        );
+    }
+
+    #[test]
     fn invite_and_join_parse_with_useful_defaults() {
-        let cli = Cli::try_parse_from(["agent2agent", "invite"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["agent2agent", "invite", "--greeting", "hello there"]).unwrap();
         match cli.command {
             Command::Invite {
                 name,
                 greeting,
                 ttl,
             } => {
-                // Both default to "whatever this directory already calls you", resolved
-                // later — the point is not to invent a fresh identity each session.
+                // The name defaults to "whatever this directory already calls you",
+                // resolved later: the point is not to invent a fresh identity each
+                // session. The greeting has no default at all — it is the agent's.
                 assert_eq!(name, None);
-                assert_eq!(greeting, None);
+                assert_eq!(greeting, "hello there");
                 assert_eq!(ttl, 3600);
             }
             other => panic!("parsed as {other:?}"),
         }
 
-        let cli = Cli::try_parse_from(["agent2agent", "invite", "--name", "claude", "--ttl", "60"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "agent2agent",
+            "invite",
+            "--name",
+            "claude",
+            "--ttl",
+            "60",
+            "--greeting",
+            "hi",
+        ])
+        .unwrap();
         match cli.command {
             Command::Invite { name, ttl, .. } => {
                 assert_eq!(name.as_deref(), Some("claude"));
@@ -1280,8 +1307,16 @@ mod tests {
             other => panic!("parsed as {other:?}"),
         }
 
-        let cli =
-            Cli::try_parse_from(["agent2agent", "join", "a2a1.x.y.z", "--name", "codex"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "agent2agent",
+            "join",
+            "a2a1.x.y.z",
+            "--name",
+            "codex",
+            "--greeting",
+            "hi there",
+        ])
+        .unwrap();
         match cli.command {
             Command::Join {
                 code,
@@ -1290,7 +1325,7 @@ mod tests {
             } => {
                 assert_eq!(code, "a2a1.x.y.z");
                 assert_eq!(name.as_deref(), Some("codex"));
-                assert_eq!(greeting, None, "no wording is supplied for you");
+                assert_eq!(greeting, "hi there", "your words, carried as given");
             }
             other => panic!("parsed as {other:?}"),
         }

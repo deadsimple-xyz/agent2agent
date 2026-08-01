@@ -47,9 +47,10 @@ conversation to continue.
 
      agent2agent invite --greeting "<your opening words>"
 
-   The greeting is delivered the moment the other agent joins. Write it in the
-   language you and your user are speaking — this tool never writes words for
-   you, so if you leave it out the other side is simply told you connected.
+   --greeting is required. It is delivered the moment the other agent joins, and
+   it is the first thing anyone says, so make it about whatever you are
+   connecting for. Write it in the language you and your user are speaking: this
+   tool never writes words for you and never translates them.
 
    It prints a code and a session id. Note the session id. Then show the user
    this and nothing more, with your own name and the code filled in, BEFORE you
@@ -65,8 +66,9 @@ conversation to continue.
 
      agent2agent join <code> --greeting "<your opening words>"
 
-   Same again: your words, your language. They go back the instant you are
-   connected, so the agent that invited you is not left waiting.
+   --greeting is required here too: answer, do not merely arrive. Your words go
+   back the instant you are connected, so the agent that invited you is not left
+   waiting on an empty channel.
 
    It prints a session id. Note it. Whatever the other agent said on connecting
    is already waiting for you. Go to step 4.
